@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NewAPI 订阅兑换台</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body data-page="redeem">
+  <main class="notebook-shell redeem-shell">
+    <header class="top-note">
+      <div>
+        <p class="eyebrow">NewAPI Subscription Redeemer</p>
+        <h1>订阅兑换手帐</h1>
+      </div>
+      <div class="header-tools">
+        <div class="service-pin" aria-live="polite">
+          <span class="pin-dot" id="health-dot"></span>
+          <span id="health-text">连接中</span>
+        </div>
+      </div>
+    </header>
+
+    <section class="single-workspace">
+      <article class="paper-card redeem-card tilt-left">
+        <div class="card-title-row">
+          <h2>用户兑换</h2>
+          <span class="doodle-badge">step 1</span>
+        </div>
+        <form id="review-form" class="sketch-form">
+          <label>
+            <span>兑换码</span>
+            <input id="redeem-code" name="code" autocomplete="one-time-code" placeholder="PRO-ABCD-EFGH-JKLM" required>
+          </label>
+          <label>
+            <span>NewAPI 用户 ID</span>
+            <input id="redeem-user-id" name="user_id" type="number" min="1" inputmode="numeric" placeholder="123" required>
+          </label>
+          <button class="primary-button" type="submit">
+            <span class="button-mark">?</span>
+            <span>核对兑换信息</span>
+          </button>
+        </form>
+
+        <section id="review-panel" class="result-note review-panel" hidden>
+          <div class="card-title-row">
+            <h3>核对结果</h3>
+            <span class="doodle-badge">step 2</span>
+          </div>
+          <dl class="review-list">
+            <div>
+              <dt>兑换码</dt>
+              <dd id="review-code">-</dd>
+            </div>
+            <div>
+              <dt>用户 ID</dt>
+              <dd id="review-user-id">-</dd>
+            </div>
+            <div>
+              <dt>套餐 ID</dt>
+              <dd id="review-plan-id">-</dd>
+            </div>
+            <div>
+              <dt>过期时间</dt>
+              <dd id="review-expires-at">-</dd>
+            </div>
+          </dl>
+          <div class="button-row">
+            <button class="primary-button" id="confirm-redeem" type="button">
+              <span class="button-mark">-></span>
+              <span>确认激活</span>
+            </button>
+            <button class="ghost-button" id="edit-review" type="button">返回修改</button>
+          </div>
+        </section>
+
+        <div id="redeem-result" class="result-note" hidden></div>
+      </article>
+    </section>
+  </main>
+  <div id="toast" class="toast-note" role="status" hidden></div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

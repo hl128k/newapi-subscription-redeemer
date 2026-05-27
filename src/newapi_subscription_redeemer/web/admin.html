@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NewAPI 订阅兑换台 - 管理员</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body data-page="admin">
+  <main class="notebook-shell">
+    <header class="top-note">
+      <div>
+        <p class="eyebrow">NewAPI Subscription Redeemer</p>
+        <h1>管理员便签板</h1>
+      </div>
+      <div class="header-tools">
+        <a class="nav-note" href="/">用户页</a>
+        <div class="service-pin" aria-live="polite">
+          <span class="pin-dot" id="health-dot"></span>
+          <span id="health-text">连接中</span>
+        </div>
+      </div>
+    </header>
+
+    <section class="workspace-grid admin-top-grid">
+      <article class="paper-card admin-card tilt-right">
+        <div class="card-title-row">
+          <h2>管理密钥</h2>
+          <span class="doodle-badge">admin</span>
+        </div>
+        <form id="secret-form" class="sketch-form compact-form">
+          <label>
+            <span>管理密钥</span>
+            <input id="admin-secret" name="admin_secret" type="password" autocomplete="current-password" placeholder="REDEEMER_ADMIN_SECRET">
+          </label>
+          <div class="button-row">
+            <button class="secondary-button" type="submit">记住本页</button>
+            <button class="ghost-button" id="clear-secret" type="button">清除</button>
+          </div>
+        </form>
+        <p class="micro-note" id="secret-state">密钥只保存在当前浏览器会话中。</p>
+      </article>
+
+      <article class="paper-card create-card">
+        <div class="card-title-row">
+          <h2>生成兑换码</h2>
+          <span class="scribble-line" aria-hidden="true"></span>
+        </div>
+        <form id="create-form" class="sketch-form create-grid">
+          <label>
+            <span>套餐 ID</span>
+            <input id="create-plan-id" name="plan_id" type="number" min="1" inputmode="numeric" required>
+          </label>
+          <label>
+            <span>数量</span>
+            <input id="create-count" name="count" type="number" min="1" max="1000" value="1" inputmode="numeric" required>
+          </label>
+          <label>
+            <span>前缀</span>
+            <input id="create-prefix" name="prefix" maxlength="12" value="SUB">
+          </label>
+          <label>
+            <span>过期时间</span>
+            <input id="create-expires-at" name="expires_at" type="datetime-local">
+          </label>
+          <label class="wide-field">
+            <span>备注</span>
+            <input id="create-note" name="note" placeholder="活动、批次或用途">
+          </label>
+          <button class="primary-button wide-button" type="submit">
+            <span class="button-mark">+</span>
+            <span>生成</span>
+          </button>
+        </form>
+        <div id="create-result" class="result-note" hidden></div>
+      </article>
+    </section>
+
+    <section class="admin-board one-column-board">
+      <article class="paper-card list-card">
+        <div class="list-header">
+          <div>
+            <h2>兑换码清单</h2>
+            <p class="micro-note" id="list-summary">等待刷新</p>
+          </div>
+          <button class="secondary-button" id="refresh-codes" type="button">刷新</button>
+        </div>
+
+        <div class="filters-row">
+          <label>
+            <span>状态</span>
+            <select id="filter-status">
+              <option value="">全部</option>
+              <option value="active">active</option>
+              <option value="pending">pending</option>
+              <option value="used">used</option>
+              <option value="disabled">disabled</option>
+            </select>
+          </label>
+          <label>
+            <span>套餐 ID</span>
+            <input id="filter-plan-id" type="number" min="1" inputmode="numeric" placeholder="全部">
+          </label>
+          <label>
+            <span>条数</span>
+            <input id="filter-limit" type="number" min="1" max="5000" value="50" inputmode="numeric">
+          </label>
+        </div>
+
+        <div id="codes-list" class="codes-list" aria-live="polite">
+          <div class="empty-state">还没有加载兑换码。</div>
+        </div>
+      </article>
+
+      <article class="paper-card list-card audit-card">
+        <div class="list-header">
+          <div>
+            <h2>审计日志</h2>
+            <p class="micro-note" id="audit-summary">等待刷新</p>
+          </div>
+          <button class="secondary-button" id="refresh-audit" type="button">刷新</button>
+        </div>
+
+        <div class="filters-row audit-filters">
+          <label>
+            <span>事件类型</span>
+            <select id="filter-event-type">
+              <option value="">全部</option>
+              <option value="codes.created">codes.created</option>
+              <option value="code.status_changed">code.status_changed</option>
+              <option value="code.redeemed">code.redeemed</option>
+              <option value="code.redeem_failed">code.redeem_failed</option>
+            </select>
+          </label>
+          <label>
+            <span>兑换码</span>
+            <input id="filter-audit-code" placeholder="全部">
+          </label>
+          <label>
+            <span>条数</span>
+            <input id="filter-audit-limit" type="number" min="1" max="5000" value="50" inputmode="numeric">
+          </label>
+        </div>
+
+        <div id="audit-list" class="codes-list audit-list" aria-live="polite">
+          <div class="empty-state">还没有加载审计日志。</div>
+        </div>
+      </article>
+    </section>
+  </main>
+  <div id="toast" class="toast-note" role="status" hidden></div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
