@@ -1,0 +1,131 @@
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-binaries-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            ext: ""
+            archive_ext: tar.gz
+          - goos: linux
+            goarch: arm64
+            ext: ""
+            archive_ext: tar.gz
+          - goos: windows
+            goarch: amd64
+            ext: ".exe"
+            archive_ext: zip
+          - goos: windows
+            goarch: arm64
+            ext: ".exe"
+            archive_ext: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          EXT: ${{ matrix.ext }}
+          ARCHIVE_EXT: ${{ matrix.archive_ext }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          binary="newapi-subscription-redeemer_${GITHUB_REF_NAME}_${GOOS}_${GOARCH}${EXT}"
+          archive="newapi-subscription-redeemer_${GITHUB_REF_NAME}_${GOOS}_${GOARCH}.${ARCHIVE_EXT}"
+
+          go build \
+            -trimpath \
+            -ldflags="-s -w" \
+            -o "dist/${binary}" \
+            .
+
+          if [ "${ARCHIVE_EXT}" = "zip" ]; then
+            (cd dist && zip -q "${archive}" "${binary}")
+          else
+            tar -C dist -czf "dist/${archive}" "${binary}"
+          fi
+
+          (cd dist && sha256sum "${archive}" > "${archive}.sha256")
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: newapi-subscription-redeemer-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release upload "${tag}" dist/* --clobber
+          else
+            gh release create "${tag}" dist/* \
+              --title "${tag}" \
+              --generate-notes
+          fi
