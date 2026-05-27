@@ -48,8 +48,10 @@
         </div>
         <form id="create-form" class="sketch-form create-grid">
           <label>
-            <span>套餐 ID</span>
-            <input id="create-plan-id" name="plan_id" type="number" min="1" inputmode="numeric" required>
+            <span>套餐</span>
+            <select id="create-plan-id" name="plan_id" required>
+              <option value="">先填写管理密钥加载套餐</option>
+            </select>
           </label>
           <label>
             <span>数量</span>
@@ -98,8 +100,10 @@
             </select>
           </label>
           <label>
-            <span>套餐 ID</span>
-            <input id="filter-plan-id" type="number" min="1" inputmode="numeric" placeholder="全部">
+            <span>套餐</span>
+            <select id="filter-plan-id">
+              <option value="">全部套餐</option>
+            </select>
           </label>
           <label>
             <span>条数</span>
@@ -126,10 +130,10 @@
             <span>事件类型</span>
             <select id="filter-event-type">
               <option value="">全部</option>
-              <option value="codes.created">codes.created</option>
-              <option value="code.status_changed">code.status_changed</option>
-              <option value="code.redeemed">code.redeemed</option>
-              <option value="code.redeem_failed">code.redeem_failed</option>
+              <option value="codes.created">生成兑换码</option>
+              <option value="code.status_changed">兑换码状态变更</option>
+              <option value="code.redeemed">兑换成功</option>
+              <option value="code.redeem_failed">兑换失败</option>
             </select>
           </label>
           <label>

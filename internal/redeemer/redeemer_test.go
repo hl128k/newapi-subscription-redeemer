@@ -180,25 +180,42 @@ func TestCreateCodesWritesAuditEvent(t *testing.T) {
 func TestPreviewRedeemCodeFetchesUserAndRequiresEmail(t *testing.T) {
 	ctx := context.Background()
 	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/api/user/123" {
-			t.Fatalf("unexpected user lookup: %s %s", r.Method, r.URL.Path)
-		}
 		if r.Header.Get("New-Api-User") != "99" {
 			t.Fatalf("missing New-Api-User header")
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"success": true,
-			"data": map[string]any{
-				"id":       123,
-				"username": "alice",
-				"email":    "alice@example.com",
-				"group":    "pro",
-				"subscription": map[string]any{
-					"plan_id": 3,
-					"status":  "active",
+		if r.Method != http.MethodGet {
+			t.Fatalf("unexpected method: %s", r.Method)
+		}
+		switch r.URL.Path {
+		case "/api/user/123":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"data": map[string]any{
+					"id":       123,
+					"username": "alice",
+					"email":    "alice@example.com",
+					"group":    "pro",
+					"subscription": map[string]any{
+						"plan_id": 3,
+						"status":  "active",
+					},
 				},
-			},
-		})
+			})
+		case "/api/subscription/admin/plans":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"data": []map[string]any{
+					{
+						"plan": map[string]any{
+							"id":    3,
+							"title": "Pro Monthly",
+						},
+					},
+				},
+			})
+		default:
+			t.Fatalf("unexpected NewAPI lookup: %s %s", r.Method, r.URL.Path)
+		}
 	}))
 	defer stub.Close()
 
@@ -214,6 +231,9 @@ func TestPreviewRedeemCodeFetchesUserAndRequiresEmail(t *testing.T) {
 	user := result["user"].(map[string]any)
 	if user["username"] != "alice" || user["email"] != "alice@example.com" {
 		t.Fatalf("unexpected user info: %#v", user)
+	}
+	if result["plan_name"] != "Pro Monthly" {
+		t.Fatalf("unexpected plan name: %#v", result)
 	}
 	if _, err := service.PreviewRedeemCode(ctx, created[0]["code"].(string), 123, "other@example.com"); err == nil {
 		t.Fatalf("expected email mismatch error")
@@ -356,6 +376,59 @@ func TestRedeemCodeSuccess(t *testing.T) {
 	}
 }
 
+func TestRedeemCodeAuditIncludesVerifiedUser(t *testing.T) {
+	ctx := context.Background()
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/user/123":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"data": map[string]any{
+					"id":       123,
+					"username": "alice",
+					"email":    "alice@example.com",
+				},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/subscription/admin/bind":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"message": "ok",
+			})
+		default:
+			t.Fatalf("unexpected NewAPI request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer stub.Close()
+
+	service := testService(t, stub.URL)
+	created, err := service.CreateCodes(ctx, CreateCodesInput{PlanID: 3, Count: 1, Prefix: "USR"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RedeemCode(ctx, RedeemInput{
+		Code:   created[0]["code"].(string),
+		UserID: 123,
+		Email:  "Alice@Example.com",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := service.ListAuditEvents(ctx, "code.redeemed", "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected one redeemed event, got %d", len(events))
+	}
+	metadata := events[0]["metadata"].(map[string]any)
+	if metadata["redeem_username"] != "alice" || metadata["redeem_email"] != "alice@example.com" {
+		t.Fatalf("expected verified user metadata, got %#v", metadata)
+	}
+	if int64(metadata["redeem_user_id"].(float64)) != 123 {
+		t.Fatalf("unexpected redeem user id: %#v", metadata)
+	}
+}
+
 func TestAdminAPIRequiresPrefixAndReturnsAudit(t *testing.T) {
 	service := testService(t, "http://127.0.0.1:1")
 	server := httptest.NewServer(NewHandler(service.config, service, fstest.MapFS{}))
@@ -414,6 +487,58 @@ func TestAdminAPIRequiresPrefixAndReturnsAudit(t *testing.T) {
 	}
 	if !payload.Success || len(payload.Data) != 1 || payload.Data[0]["event_type"] != "codes.created" {
 		t.Fatalf("unexpected audit payload: %#v", payload)
+	}
+}
+
+func TestAdminPlansEndpointReturnsSubscriptionNames(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/subscription/admin/plans" {
+			t.Fatalf("unexpected plans lookup: %s %s", r.Method, r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": true,
+			"data": []map[string]any{
+				{
+					"plan": map[string]any{
+						"id":      8,
+						"title":   "Team Annual",
+						"enabled": false,
+					},
+				},
+			},
+		})
+	}))
+	defer stub.Close()
+
+	service := testService(t, stub.URL)
+	server := httptest.NewServer(NewHandler(service.config, service, fstest.MapFS{}))
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodGet, server.URL+"/xx/api/v1/admin/plans", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Admin-Secret", "test-secret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected plans status 200, got %d", resp.StatusCode)
+	}
+	var payload struct {
+		Success bool             `json:"success"`
+		Data    []map[string]any `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if !payload.Success || len(payload.Data) != 1 {
+		t.Fatalf("unexpected plans payload: %#v", payload)
+	}
+	if payload.Data[0]["plan_name"] != "Team Annual" || payload.Data[0]["enabled"] != false {
+		t.Fatalf("expected normalized plan name and enabled flag, got %#v", payload.Data[0])
 	}
 }
 

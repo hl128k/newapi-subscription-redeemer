@@ -489,10 +489,16 @@ func (s *Service) PreviewRedeemCode(ctx context.Context, code string, userID int
 	if err != nil {
 		return nil, err
 	}
+	plan, err := s.fetchSubscriptionPlan(ctx, record.PlanID)
+	if err != nil {
+		return nil, err
+	}
 	return map[string]any{
 		"code":       record.Code,
 		"user_id":    userID,
 		"plan_id":    record.PlanID,
+		"plan_name":  subscriptionPlanName(plan, record.PlanID),
+		"plan":       plan,
 		"status":     record.Status,
 		"expires_at": nullIntToAny(record.ExpiresAt),
 		"user":       user,
@@ -507,6 +513,7 @@ func (s *Service) RedeemCode(ctx context.Context, input RedeemInput) (map[string
 	if input.UserID <= 0 {
 		return nil, serviceError("user_id 必须大于 0", http.StatusBadRequest)
 	}
+	var verifiedUser map[string]any
 	if strings.TrimSpace(input.Email) != "" {
 		record, err := s.fetchCodeByCode(ctx, s.db, code)
 		if err != nil {
@@ -515,9 +522,11 @@ func (s *Service) RedeemCode(ctx context.Context, input RedeemInput) (map[string
 		if err := validateRedeemable(record); err != nil {
 			return nil, err
 		}
-		if _, err := s.verifyNewAPIUserEmail(ctx, input.UserID, input.Email); err != nil {
+		user, err := s.verifyNewAPIUserEmail(ctx, input.UserID, input.Email)
+		if err != nil {
 			return nil, err
 		}
+		verifiedUser = user
 	}
 	if input.AuditActorType == "" {
 		input.AuditActorType = "user"
@@ -542,12 +551,12 @@ func (s *Service) RedeemCode(ctx context.Context, input RedeemInput) (map[string
 			PlanID:    &claimed.PlanID,
 			Status:    "active",
 			Message:   err.Error(),
-			Metadata:  mergeMetadata(map[string]any{"user_id": input.UserID}, input.AuditMetadata),
+			Metadata:  redeemAuditMetadata(input.UserID, verifiedUser, input.AuditMetadata),
 		})
 		return nil, err
 	}
 
-	return s.finalizeClaim(ctx, claimed.ID, claimed.PendingToken.String, input.UserID, newAPIResult, input)
+	return s.finalizeClaim(ctx, claimed.ID, claimed.PendingToken.String, input.UserID, verifiedUser, newAPIResult, input)
 }
 
 func (s *Service) claimCode(ctx context.Context, code string, userID int64) (*CodeRecord, error) {
@@ -593,7 +602,7 @@ func (s *Service) releaseClaim(ctx context.Context, codeID int64, pendingToken, 
 	return err
 }
 
-func (s *Service) finalizeClaim(ctx context.Context, codeID int64, pendingToken string, userID int64, result NewAPIResult, input RedeemInput) (map[string]any, error) {
+func (s *Service) finalizeClaim(ctx context.Context, codeID int64, pendingToken string, userID int64, verifiedUser map[string]any, result NewAPIResult, input RedeemInput) (map[string]any, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -634,7 +643,7 @@ func (s *Service) finalizeClaim(ctx context.Context, codeID int64, pendingToken 
 		PlanID:    &record.PlanID,
 		Status:    "used",
 		Message:   result.Message,
-		Metadata:  mergeMetadata(map[string]any{"user_id": userID}, input.AuditMetadata),
+		Metadata:  redeemAuditMetadata(userID, verifiedUser, input.AuditMetadata),
 	}); err != nil {
 		return nil, err
 	}
@@ -797,6 +806,48 @@ func (s *Service) fetchNewAPIUser(ctx context.Context, userID int64) (map[string
 		"raw":          rawUser,
 	}
 	return user, nil
+}
+
+func (s *Service) fetchSubscriptionPlan(ctx context.Context, planID int64) (map[string]any, error) {
+	if planID <= 0 {
+		return nil, serviceError("plan_id 必须大于 0", http.StatusBadRequest)
+	}
+	plans, err := s.ListSubscriptionPlans(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, plan := range plans {
+		if id, ok := intField(plan, "id"); ok && id == planID {
+			return plan, nil
+		}
+	}
+	return nil, serviceError(fmt.Sprintf("NewAPI 中不存在套餐 ID %d", planID), http.StatusBadGateway)
+}
+
+func (s *Service) ListSubscriptionPlans(ctx context.Context) ([]map[string]any, error) {
+	data, err := s.doNewAPIAdminJSON(ctx, http.MethodGet, "/api/subscription/admin/plans", nil)
+	if err != nil {
+		return nil, err
+	}
+	if success, ok := data["success"].(bool); ok && !success {
+		message := firstString(data, "message")
+		if message == "" {
+			message = "unknown error"
+		}
+		return nil, serviceError("NewAPI 查询套餐失败: "+message, http.StatusBadGateway)
+	}
+	plans := make([]map[string]any, 0)
+	for _, item := range subscriptionPlanItems(data) {
+		plan := unwrapSubscriptionPlanItem(item)
+		id, ok := intField(plan, "id")
+		if !ok || id <= 0 {
+			continue
+		}
+		plan["id"] = id
+		plan["plan_name"] = subscriptionPlanName(plan, id)
+		plans = append(plans, plan)
+	}
+	return plans, nil
 }
 
 func (s *Service) doNewAPIAdminJSON(ctx context.Context, method, path string, payload any) (map[string]any, error) {
@@ -1008,6 +1059,12 @@ func (h *Handler) handleGET(w http.ResponseWriter, r *http.Request) {
 		status := r.URL.Query().Get("status")
 		planID := queryOptionalInt(r, "plan_id")
 		items, err := h.service.ListCodes(r.Context(), status, planID, limit)
+		h.writeResult(w, items, err, http.StatusOK)
+	case r.URL.Path == h.config.AdminAPIPath("/api/v1/admin/plans"):
+		if !h.requireAdmin(w, r) {
+			return
+		}
+		items, err := h.service.ListSubscriptionPlans(r.Context())
 		h.writeResult(w, items, err, http.StatusOK)
 	case r.URL.Path == h.config.AdminAPIPath("/api/v1/admin/audit-events"):
 		if !h.requireAdmin(w, r) {
@@ -1992,6 +2049,19 @@ func mergeMetadata(base map[string]any, extra map[string]any) map[string]any {
 	return base
 }
 
+func redeemAuditMetadata(userID int64, user map[string]any, extra map[string]any) map[string]any {
+	metadata := map[string]any{"user_id": userID, "redeem_user_id": userID}
+	if user != nil {
+		if username := firstString(user, "username", "name", "display_name"); username != "" {
+			metadata["redeem_username"] = username
+		}
+		if email := firstString(user, "email"); email != "" {
+			metadata["redeem_email"] = email
+		}
+	}
+	return mergeMetadata(metadata, extra)
+}
+
 func randomHex(bytesCount int) (string, error) {
 	data := make([]byte, bytesCount)
 	if _, err := rand.Read(data); err != nil {
@@ -2121,6 +2191,40 @@ func firstNonNil(values ...any) any {
 		}
 	}
 	return nil
+}
+
+func subscriptionPlanItems(data map[string]any) []any {
+	for _, candidate := range []any{data["data"], data["plans"], data["items"]} {
+		if items, ok := candidate.([]any); ok {
+			return items
+		}
+	}
+	if nested, ok := data["data"].(map[string]any); ok {
+		for _, candidate := range []any{nested["plans"], nested["items"], nested["list"]} {
+			if items, ok := candidate.([]any); ok {
+				return items
+			}
+		}
+	}
+	return nil
+}
+
+func unwrapSubscriptionPlanItem(item any) map[string]any {
+	raw, ok := item.(map[string]any)
+	if !ok {
+		return nil
+	}
+	if plan, ok := raw["plan"].(map[string]any); ok {
+		return plan
+	}
+	return raw
+}
+
+func subscriptionPlanName(plan map[string]any, planID int64) string {
+	if name := firstString(plan, "title", "name", "display_name"); name != "" {
+		return name
+	}
+	return fmt.Sprintf("套餐 %d", planID)
 }
 
 func intField(payload map[string]any, key string) (int64, bool) {

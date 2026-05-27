@@ -1,11 +1,20 @@
 const state = {
   adminSecret: sessionStorage.getItem("redeemer_admin_secret") || "",
+  plans: [],
+  plansById: new Map(),
+  plansLoaded: false,
   review: null,
   toastTimer: null,
 };
 
 const page = document.body.dataset.page || "redeem";
 const $ = (selector) => document.querySelector(selector);
+const auditEventLabels = {
+  "codes.created": "生成兑换码",
+  "code.status_changed": "兑换码状态变更",
+  "code.redeemed": "兑换成功",
+  "code.redeem_failed": "兑换失败",
+};
 
 function currentAdminApiBase() {
   const marker = "/admin";
@@ -110,10 +119,13 @@ function clearReview() {
 }
 
 function fillReview(data) {
+  const planName = data.plan_name || data.plan?.title || data.plan?.name || "";
   state.review = {
     code: data.code,
     user_id: data.user_id,
     email: data.user?.email || data.email || "",
+    plan_id: data.plan_id,
+    plan_name: planName,
   };
   const subscription = data.user?.subscription;
   $("#review-code").textContent = data.code;
@@ -122,7 +134,7 @@ function fillReview(data) {
   $("#review-email").textContent = data.user?.email || "-";
   $("#review-group").textContent = data.user?.group || "-";
   $("#review-subscription").textContent = subscription ? JSON.stringify(subscription) : "未返回";
-  $("#review-plan-id").textContent = String(data.plan_id);
+  $("#review-plan-name").textContent = planName || "未返回";
   $("#review-expires-at").textContent = formatTime(data.expires_at);
   $("#review-panel").hidden = false;
 }
@@ -153,13 +165,15 @@ function bindRedeemPage() {
       return;
     }
     result.hidden = true;
+    const review = state.review;
     try {
       const payload = await apiJson("/api/v1/redeem", {
         method: "POST",
-        body: state.review,
+        body: review,
       });
       clearReview();
-      setResult(result, true, payload.message || "订阅已激活");
+      const planSuffix = review?.plan_name ? `：${review.plan_name}` : "";
+      setResult(result, true, `${payload.message || "订阅已激活"}${planSuffix}`);
     } catch (error) {
       setResult(result, false, error.message);
     }
@@ -181,9 +195,126 @@ function syncSecretField() {
   label.textContent = state.adminSecret ? "管理密钥已保存在当前浏览器会话中。" : "密钥只保存在当前浏览器会话中。";
 }
 
+function planIdOf(plan) {
+  const id = Number(plan?.id ?? plan?.plan_id);
+  return Number.isFinite(id) && id > 0 ? id : null;
+}
+
+function normalizeBool(value) {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "number") {
+    return value !== 0;
+  }
+  if (typeof value === "string") {
+    const text = value.trim().toLowerCase();
+    if (["1", "true", "enabled", "active"].includes(text)) {
+      return true;
+    }
+    if (["0", "false", "disabled", "inactive"].includes(text)) {
+      return false;
+    }
+  }
+  return null;
+}
+
+function planEnabled(plan) {
+  return normalizeBool(plan?.enabled ?? plan?.enable ?? plan?.is_enabled);
+}
+
+function planStatusText(plan) {
+  const enabled = planEnabled(plan);
+  if (enabled === true) {
+    return "启用";
+  }
+  if (enabled === false) {
+    return "停用";
+  }
+  return "状态未知";
+}
+
+function planName(plan) {
+  const id = planIdOf(plan);
+  return plan?.plan_name || plan?.title || plan?.name || plan?.display_name || (id ? `套餐 ${id}` : "未知套餐");
+}
+
+function planLabel(plan) {
+  return `${planName(plan)}（${planStatusText(plan)}）`;
+}
+
+function planLabelById(planId) {
+  const id = Number(planId);
+  const plan = state.plansById.get(String(id));
+  return plan ? planLabel(plan) : `套餐 ${id}`;
+}
+
+function auditEventLabel(eventType) {
+  return auditEventLabels[eventType] || eventType || "-";
+}
+
+function auditRedeemUser(item) {
+  const metadata = item.metadata || {};
+  const userId = metadata.redeem_user_id || metadata.user_id || "";
+  const username = metadata.redeem_username || metadata.username || "";
+  const email = metadata.redeem_email || metadata.email || "";
+  const label = username && userId ? `${username} (${userId})` : username || (userId ? `ID ${userId}` : "");
+  return { label, email };
+}
+
+function resetPlans() {
+  state.plans = [];
+  state.plansById = new Map();
+  state.plansLoaded = false;
+  renderPlanSelects();
+}
+
+function renderPlanSelects() {
+  const createSelect = $("#create-plan-id");
+  const filterSelect = $("#filter-plan-id");
+  if (!createSelect || !filterSelect) {
+    return;
+  }
+
+  const createCurrent = createSelect.value;
+  const filterCurrent = filterSelect.value;
+  const createPlaceholderText = state.plansLoaded && state.plans.length === 0
+    ? "没有可用套餐"
+    : state.plansLoaded ? "选择套餐" : "先填写管理密钥加载套餐";
+  const createPlaceholder = new Option(createPlaceholderText, "");
+  createPlaceholder.disabled = true;
+  const filterPlaceholder = new Option("全部套餐", "");
+  const planOptions = state.plans.map((plan) => new Option(planLabel(plan), String(planIdOf(plan))));
+
+  createSelect.replaceChildren(createPlaceholder, ...planOptions.map((option) => option.cloneNode(true)));
+  filterSelect.replaceChildren(filterPlaceholder, ...planOptions);
+  createSelect.value = Array.from(createSelect.options).some((option) => option.value === createCurrent) ? createCurrent : "";
+  filterSelect.value = Array.from(filterSelect.options).some((option) => option.value === filterCurrent) ? filterCurrent : "";
+}
+
+async function loadPlans(options = {}) {
+  if (!state.adminSecret) {
+    resetPlans();
+    return [];
+  }
+  if (state.plansLoaded && !options.force) {
+    return state.plans;
+  }
+  const payload = await apiJson(`${currentAdminApiBase()}/plans`, { admin: true });
+  state.plans = Array.isArray(payload.data) ? payload.data : [];
+  state.plansById = new Map(
+    state.plans
+      .map((plan) => [String(planIdOf(plan)), plan])
+      .filter(([id]) => id !== "null"),
+  );
+  state.plansLoaded = true;
+  renderPlanSelects();
+  return state.plans;
+}
+
 function describeCode(item) {
   const parts = [
-    `套餐 ${item.plan_id}`,
+    planLabelById(item.plan_id),
     `创建 ${formatTime(item.created_at)}`,
   ];
   if (item.expires_at) {
@@ -271,7 +402,14 @@ function describeAuditEvent(item) {
     parts.push(`兑换码 ${item.code}`);
   }
   if (item.plan_id) {
-    parts.push(`套餐 ${item.plan_id}`);
+    parts.push(planLabelById(item.plan_id));
+  }
+  const redeemUser = auditRedeemUser(item);
+  if (redeemUser.label) {
+    parts.push(`用户 ${redeemUser.label}`);
+  }
+  if (redeemUser.email) {
+    parts.push(`邮箱 ${redeemUser.email}`);
   }
   if (item.status) {
     parts.push(`状态 ${item.status}`);
@@ -300,7 +438,7 @@ function renderAuditEvents(items) {
 
       const title = document.createElement("p");
       title.className = "code-text";
-      title.textContent = item.event_type;
+      title.textContent = auditEventLabel(item.event_type);
 
       const meta = document.createElement("p");
       meta.className = "code-meta";
@@ -321,6 +459,7 @@ function renderAuditEvents(items) {
 }
 
 async function refreshCodes() {
+  await loadPlans();
   const status = $("#filter-status").value;
   const planId = $("#filter-plan-id").value.trim();
   const limit = $("#filter-limit").value.trim() || "50";
@@ -336,6 +475,7 @@ async function refreshCodes() {
 }
 
 async function refreshAuditEvents() {
+  await loadPlans();
   const eventType = $("#filter-event-type").value;
   const code = $("#filter-audit-code").value.trim();
   const limit = $("#filter-audit-limit").value.trim() || "50";
@@ -350,20 +490,44 @@ async function refreshAuditEvents() {
   renderAuditEvents(payload.data || []);
 }
 
+async function refreshAdminLists() {
+  await refreshCodes();
+  await refreshAuditEvents();
+}
+
 function bindAdminPage() {
   syncSecretField();
+  renderPlanSelects();
+  if (state.adminSecret) {
+    refreshAdminLists().catch((error) => showToast(error.message));
+  }
 
-  $("#secret-form").addEventListener("submit", (event) => {
+  $("#secret-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     state.adminSecret = $("#admin-secret").value.trim();
+    if (!state.adminSecret) {
+      sessionStorage.removeItem("redeemer_admin_secret");
+      resetPlans();
+      syncSecretField();
+      showToast("请先填写管理密钥");
+      return;
+    }
     sessionStorage.setItem("redeemer_admin_secret", state.adminSecret);
     syncSecretField();
-    showToast("管理密钥已记住");
+    try {
+      await loadPlans({ force: true });
+      await refreshAdminLists();
+      showToast(`已加载 ${state.plans.length} 个套餐`);
+    } catch (error) {
+      resetPlans();
+      showToast(error.message);
+    }
   });
 
   $("#clear-secret").addEventListener("click", () => {
     state.adminSecret = "";
     sessionStorage.removeItem("redeemer_admin_secret");
+    resetPlans();
     syncSecretField();
     showToast("管理密钥已清除");
   });
@@ -373,6 +537,7 @@ function bindAdminPage() {
     const result = $("#create-result");
     result.hidden = true;
     try {
+      await loadPlans();
       const payload = await apiJson(`${currentAdminApiBase()}/codes`, {
         method: "POST",
         admin: true,
