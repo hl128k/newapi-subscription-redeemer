@@ -5,6 +5,7 @@ __pycache__/
 *.sqlite3
 .env
 .env.*
+!.env.example
 redeemer-go.exe
 *.exe~
 redeemer-linux-*

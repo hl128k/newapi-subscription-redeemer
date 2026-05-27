@@ -28,7 +28,7 @@ NewAPI Subscription Redeemer 是一个独立的兑换码桥接服务。它在本
 ├── internal/redeemer/       # Go 后端实现
 ├── web/                     # 嵌入到 Go 二进制的网页 UI
 ├── internal/redeemer/redeemer_test.go
-├── config.example.env       # 环境变量示例
+├── .env.example             # 环境变量示例
 ├── Dockerfile
 ├── docker-compose.yml
 ├── go.mod
@@ -40,7 +40,7 @@ NewAPI Subscription Redeemer 是一个独立的兑换码桥接服务。它在本
 复制配置示例，并按实际环境填写：
 
 ```bash
-cp config.example.env .env.example.local
+cp .env.example .env.local
 ```
 
 至少需要配置：
