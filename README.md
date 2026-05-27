@@ -17,22 +17,22 @@ NewAPI Subscription Redeemer 是一个独立的兑换码桥接服务。它在本
 - 管理员网页和管理员 API 统一使用入口前缀
 - 操作审计日志记录发码、状态变更、兑换成功和兑换失败
 - `active -> pending -> used` 状态机，降低重复激活风险
-- 零额外 Python 运行时依赖
-- 支持 Docker 和 Docker Compose 部署
+- Go 单二进制运行，Web UI 直接嵌入二进制
+- Docker 多阶段构建，运行镜像使用 `scratch`
 
 ## 项目结构
 
 ```text
 .
-├── src/newapi_subscription_redeemer/
-│   ├── redeemer.py          # 主服务实现
-│   └── web/                 # 内置网页 UI
-├── redeemer.py              # 兼容旧命令的启动入口
-├── test_redeemer.py         # 单元测试
+├── main.go                  # Go 服务入口
+├── internal/redeemer/       # Go 后端实现
+├── web/                     # 嵌入到 Go 二进制的网页 UI
+├── internal/redeemer/redeemer_test.go
 ├── config.example.env       # 环境变量示例
 ├── Dockerfile
 ├── docker-compose.yml
-└── pyproject.toml
+├── go.mod
+└── go.sum
 ```
 
 ## 快速开始
@@ -57,13 +57,13 @@ export REDEEMER_DB_PATH="$(pwd)/redeemer.db"
 初始化数据库：
 
 ```bash
-python3 redeemer.py init-db
+go run . init-db
 ```
 
 启动服务：
 
 ```bash
-python3 redeemer.py serve --host 127.0.0.1 --port 8789
+go run . serve --host 127.0.0.1 --port 8789
 ```
 
 访问页面：
@@ -101,7 +101,7 @@ curl http://127.0.0.1:8789/healthz
 生成兑换码：
 
 ```bash
-python3 redeemer.py create-codes \
+go run . create-codes \
   --plan-id 3 \
   --count 5 \
   --prefix PRO \
@@ -111,7 +111,7 @@ python3 redeemer.py create-codes \
 生成带过期时间的兑换码：
 
 ```bash
-python3 redeemer.py create-codes \
+go run . create-codes \
   --plan-id 3 \
   --count 5 \
   --prefix PRO \
@@ -121,25 +121,25 @@ python3 redeemer.py create-codes \
 查询兑换码：
 
 ```bash
-python3 redeemer.py list-codes --status active --limit 50
+go run . list-codes --status active --limit 50
 ```
 
 查询审计日志：
 
 ```bash
-python3 redeemer.py list-audit --limit 50
+go run . list-audit --limit 50
 ```
 
 本地兑换：
 
 ```bash
-python3 redeemer.py redeem --code PRO-ABCD-EFGH-JKLM --user-id 123
+go run . redeem --code PRO-ABCD-EFGH-JKLM --user-id 123
 ```
 
 停用或恢复兑换码：
 
 ```bash
-python3 redeemer.py set-status --code PRO-ABCD-EFGH-JKLM --status disabled
+go run . set-status --code PRO-ABCD-EFGH-JKLM --status disabled
 ```
 
 ## Web UI
@@ -365,6 +365,8 @@ POST /api/subscription/admin/users/123/subscriptions
 
 ## Docker
 
+Dockerfile 使用 Go 多阶段构建，最终运行层是 `scratch`，只包含 CA 证书、`/data` 目录和编译后的 `redeemer` 二进制。
+
 构建镜像：
 
 ```bash
@@ -399,18 +401,54 @@ docker compose up -d --build
 
 Compose 默认只绑定本机 `127.0.0.1:8789`，数据保存在 `redeemer-data` 卷中。
 
+## GitHub Actions 镜像构建
+
+仓库包含 GitHub Actions 工作流：
+
+```text
+.github/workflows/docker-image.yml
+```
+
+触发规则：
+
+- push 到 `main` 或 `master`：构建并推送 `latest`、分支 tag 和 `sha-*` tag
+- push `v*.*.*` tag：构建并推送对应版本 tag
+- pull request：只构建，不推送
+- `workflow_dispatch`：支持手动触发
+
+镜像会推送到 GHCR：
+
+```text
+ghcr.io/<owner>/<repo>
+```
+
+工作流默认构建：
+
+```text
+linux/amd64
+linux/arm64
+```
+
+首次使用时，需要在 GitHub 仓库的 Packages 设置里确认镜像可见性；私有仓库默认会生成私有镜像。
+
 ## 开发
 
 运行测试：
 
 ```bash
-python -m unittest -v
+go test ./...
+```
+
+本地构建 Go 二进制：
+
+```bash
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o redeemer .
 ```
 
 检查 CLI 入口：
 
 ```bash
-python redeemer.py --help
+go run . --help
 ```
 
 检查 Docker Compose 配置：
