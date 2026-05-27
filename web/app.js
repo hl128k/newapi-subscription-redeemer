@@ -97,6 +97,7 @@ function redeemPayloadFromForm() {
   return {
     code: $("#redeem-code").value.trim(),
     user_id: Number($("#redeem-user-id").value),
+    email: $("#redeem-email").value.trim(),
   };
 }
 
@@ -112,9 +113,15 @@ function fillReview(data) {
   state.review = {
     code: data.code,
     user_id: data.user_id,
+    email: data.user?.email || data.email || "",
   };
+  const subscription = data.user?.subscription;
   $("#review-code").textContent = data.code;
   $("#review-user-id").textContent = String(data.user_id);
+  $("#review-username").textContent = data.user?.username || "-";
+  $("#review-email").textContent = data.user?.email || "-";
+  $("#review-group").textContent = data.user?.group || "-";
+  $("#review-subscription").textContent = subscription ? JSON.stringify(subscription) : "未返回";
   $("#review-plan-id").textContent = String(data.plan_id);
   $("#review-expires-at").textContent = formatTime(data.expires_at);
   $("#review-panel").hidden = false;
@@ -161,6 +168,7 @@ function bindRedeemPage() {
   $("#edit-review").addEventListener("click", clearReview);
   $("#redeem-code").addEventListener("input", clearReview);
   $("#redeem-user-id").addEventListener("input", clearReview);
+  $("#redeem-email").addEventListener("input", clearReview);
 }
 
 function syncSecretField() {

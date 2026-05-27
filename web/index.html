@@ -3,14 +3,14 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>NewAPI 订阅兑换台</title>
+  <title>{{UPSTREAM_NAME}} 订阅兑换台</title>
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body data-page="redeem">
   <main class="notebook-shell redeem-shell">
     <header class="top-note">
       <div>
-        <p class="eyebrow">NewAPI Subscription Redeemer</p>
+        <p class="eyebrow">{{UPSTREAM_NAME}} Subscription Redeemer</p>
         <h1>订阅兑换手帐</h1>
       </div>
       <div class="header-tools">
@@ -33,8 +33,12 @@
             <input id="redeem-code" name="code" autocomplete="one-time-code" placeholder="PRO-ABCD-EFGH-JKLM" required>
           </label>
           <label>
-            <span>NewAPI 用户 ID</span>
+            <span>{{UPSTREAM_NAME}} 用户 ID</span>
             <input id="redeem-user-id" name="user_id" type="number" min="1" inputmode="numeric" placeholder="123" required>
+          </label>
+          <label>
+            <span>{{UPSTREAM_NAME}} 用户邮箱</span>
+            <input id="redeem-email" name="email" type="email" autocomplete="email" placeholder="name@example.com" required>
           </label>
           <button class="primary-button" type="submit">
             <span class="button-mark">?</span>
@@ -55,6 +59,22 @@
             <div>
               <dt>用户 ID</dt>
               <dd id="review-user-id">-</dd>
+            </div>
+            <div>
+              <dt>用户名</dt>
+              <dd id="review-username">-</dd>
+            </div>
+            <div>
+              <dt>邮箱</dt>
+              <dd id="review-email">-</dd>
+            </div>
+            <div>
+              <dt>用户分组</dt>
+              <dd id="review-group">-</dd>
+            </div>
+            <div>
+              <dt>订阅信息</dt>
+              <dd id="review-subscription">-</dd>
             </div>
             <div>
               <dt>套餐 ID</dt>

@@ -12,7 +12,9 @@ NewAPI Subscription Redeemer 是一个独立的兑换码桥接服务。它在本
 - 本地 SQLite 持久化兑换码
 - CLI 创建、查询、兑换和停用兑换码
 - HTTP API 支持用户兑换和管理员发码
-- 用户兑换支持“先核对、再确认激活”
+- 用户兑换支持“先核对、再确认激活”，核对时校验 NewAPI 用户邮箱
+- 用户核对接口按来源 IP 限流，避免对 NewAPI 形成放大请求
+- 用户 ID 和邮箱连续核对失败会写入 SQLite 并临时锁定，降低撞库风险
 - 用户网页和管理员网页分离
 - 管理员网页和管理员 API 统一使用入口前缀
 - 操作审计日志记录发码、状态变更、兑换成功和兑换失败
@@ -43,6 +45,8 @@ NewAPI Subscription Redeemer 是一个独立的兑换码桥接服务。它在本
 cp .env.example .env.local
 ```
 
+无参数启动时，程序会自动读取二进制同目录下的 `.env.local`；使用 `go run .` 开发运行时，也会读取当前工作目录下的 `.env.local`。配置优先级为：默认值 < `.env.local` < 系统环境变量 < 启动参数。
+
 至少需要配置：
 
 ```bash
@@ -63,7 +67,34 @@ go run . init-db
 启动服务：
 
 ```bash
+go run .
+```
+
+直接运行二进制或 `go run .` 会默认启动 HTTP 服务，并在数据库文件不存在时自动创建表结构。需要指定监听地址时，也可以显式使用：
+
+```bash
 go run . serve --host 127.0.0.1 --port 8789
+```
+
+`serve` 支持用启动参数覆盖环境配置：
+
+```bash
+go run . serve \
+  --db-path ./redeemer.db \
+  --host 127.0.0.1 \
+  --port 8789 \
+  --admin-secret change-this \
+  --admin-prefix xx \
+  --upstream-name NewAPI \
+  --bind-mode bind \
+  --timeout-seconds 20 \
+  --preview-rate-limit 10 \
+  --preview-rate-window-seconds 60 \
+  --preview-mismatch-limit 5 \
+  --preview-lock-seconds 900 \
+  --newapi-base-url https://your-newapi.example.com \
+  --newapi-admin-access-token your_admin_access_token \
+  --newapi-admin-user-id 1
 ```
 
 访问页面：
@@ -89,10 +120,15 @@ curl http://127.0.0.1:8789/healthz
 | `REDEEMER_DB_PATH` | `./redeemer.db` | SQLite 数据库路径 |
 | `REDEEMER_ADMIN_SECRET` | 空 | 管理 API 和管理员页密钥 |
 | `REDEEMER_ADMIN_PREFIX` | `xx` | 管理员页和管理 API 的统一前缀 |
+| `REDEEMER_UPSTREAM_NAME` | `NewAPI` | 网页上显示的上游系统名称 |
 | `REDEEMER_BIND_MODE` | `bind` | `bind` 或 `create` |
 | `REDEEMER_HOST` | `127.0.0.1` | HTTP 监听地址 |
 | `REDEEMER_PORT` | `8789` | HTTP 监听端口 |
 | `REDEEMER_TIMEOUT_SECONDS` | `20` | 调用 `newapi` 的超时时间 |
+| `REDEEMER_PREVIEW_RATE_LIMIT` | `10` | 单个来源在核对窗口内允许的请求数，`0` 表示关闭限流 |
+| `REDEEMER_PREVIEW_RATE_WINDOW_SECONDS` | `60` | 用户核对限流窗口秒数 |
+| `REDEEMER_PREVIEW_MISMATCH_LIMIT` | `5` | 同一用户 ID 或邮箱连续核对失败后触发锁定的次数，`0` 表示关闭 |
+| `REDEEMER_PREVIEW_LOCK_SECONDS` | `900` | 用户 ID 或邮箱核对失败后的锁定秒数 |
 
 `REDEEMER_ADMIN_WEB_PREFIX` 仍会被兼容读取，但新配置建议使用 `REDEEMER_ADMIN_PREFIX`。
 
@@ -133,7 +169,7 @@ go run . list-audit --limit 50
 本地兑换：
 
 ```bash
-go run . redeem --code PRO-ABCD-EFGH-JKLM --user-id 123
+go run . redeem --code PRO-ABCD-EFGH-JKLM --user-id 123 --email user@example.com
 ```
 
 停用或恢复兑换码：
@@ -144,7 +180,7 @@ go run . set-status --code PRO-ABCD-EFGH-JKLM --status disabled
 
 ## Web UI
 
-用户页用于提交兑换码和 `newapi` 用户 ID。兑换流程分两步：
+用户页用于提交兑换码、`newapi` 用户 ID 和用户邮箱。兑换流程分两步：
 
 1. 核对兑换信息
 2. 确认激活订阅
@@ -186,14 +222,15 @@ go run . set-status --code PRO-ABCD-EFGH-JKLM --status disabled
 
 ### 用户核对
 
-核对接口只读取本地兑换码状态，不会锁定兑换码，也不会调用 `newapi`。
+核对接口会读取本地兑换码状态，并调用 `newapi` 查询用户信息。只有用户 ID 和邮箱匹配时才会返回核对结果；该接口不会锁定兑换码，也不会激活订阅。
 
 ```bash
 curl -X POST http://127.0.0.1:8789/api/v1/redeem/preview \
   -H 'Content-Type: application/json' \
   -d '{
     "code": "PRO-ABCD-EFGH-JKLM",
-    "user_id": 123
+    "user_id": 123,
+    "email": "user@example.com"
   }'
 ```
 
@@ -204,7 +241,8 @@ curl -X POST http://127.0.0.1:8789/api/v1/redeem \
   -H 'Content-Type: application/json' \
   -d '{
     "code": "PRO-ABCD-EFGH-JKLM",
-    "user_id": 123
+    "user_id": 123,
+    "email": "user@example.com"
   }'
 ```
 
@@ -391,15 +429,17 @@ docker run --rm \
 
 ## Docker Compose
 
+Compose 会把 `.env.local` 只读挂载到容器内的 `/.env.local`，由程序启动时自行读取。容器内会固定覆盖 `REDEEMER_HOST=0.0.0.0` 和 `REDEEMER_DB_PATH=/data/redeemer.db`，避免本地监听地址和本地数据库路径影响容器运行。
+
 ```bash
-REDEEMER_ADMIN_SECRET="change-this" \
-NEWAPI_BASE_URL="https://your-newapi.example.com" \
-NEWAPI_ADMIN_ACCESS_TOKEN="your_admin_access_token" \
-NEWAPI_ADMIN_USER_ID="1" \
 docker compose up -d --build
 ```
 
-Compose 默认只绑定本机 `127.0.0.1:8789`，数据保存在 `redeemer-data` 卷中。
+Compose 默认只绑定本机 `127.0.0.1:8789`，数据保存在 `redeemer-data` 卷中。需要改宿主机端口时，使用系统环境变量：
+
+```bash
+REDEEMER_PORT=8790 docker compose up -d --build
+```
 
 ## GitHub Actions 镜像构建
 

@@ -11,14 +11,8 @@ services:
       REDEEMER_HOST: 0.0.0.0
       REDEEMER_PORT: 8789
       REDEEMER_DB_PATH: /data/redeemer.db
-      REDEEMER_ADMIN_SECRET: ${REDEEMER_ADMIN_SECRET:-change-this}
-      REDEEMER_ADMIN_PREFIX: ${REDEEMER_ADMIN_PREFIX:-xx}
-      REDEEMER_BIND_MODE: ${REDEEMER_BIND_MODE:-bind}
-      REDEEMER_TIMEOUT_SECONDS: ${REDEEMER_TIMEOUT_SECONDS:-20}
-      NEWAPI_BASE_URL: ${NEWAPI_BASE_URL:-}
-      NEWAPI_ADMIN_ACCESS_TOKEN: ${NEWAPI_ADMIN_ACCESS_TOKEN:-}
-      NEWAPI_ADMIN_USER_ID: ${NEWAPI_ADMIN_USER_ID:-0}
     volumes:
+      - ./.env.local:/.env.local:ro
       - redeemer-data:/data
 
 volumes:

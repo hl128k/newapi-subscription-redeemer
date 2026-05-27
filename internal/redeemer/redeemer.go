@@ -1,14 +1,17 @@
 package redeemer
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"html"
 	"io"
 	"io/fs"
 	"math/big"
@@ -17,6 +20,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -79,6 +83,18 @@ CREATE INDEX IF NOT EXISTS idx_audit_events_event_type
     ON audit_events(event_type);
 CREATE INDEX IF NOT EXISTS idx_audit_events_code
     ON audit_events(code);
+
+CREATE TABLE IF NOT EXISTS verification_locks (
+    key_type TEXT NOT NULL,
+    key_value TEXT NOT NULL,
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    locked_until INTEGER,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (key_type, key_value)
+);
+
+CREATE INDEX IF NOT EXISTS idx_verification_locks_locked_until
+    ON verification_locks(locked_until);
 `
 
 const codeColumns = `
@@ -96,8 +112,13 @@ type Config struct {
 	TimeoutSeconds         float64
 	AdminSecret            string
 	AdminPrefix            string
+	UpstreamName           string
 	Host                   string
 	Port                   int
+	PreviewRateLimit       int
+	PreviewRateWindow      time.Duration
+	PreviewMismatchLimit   int
+	PreviewLockDuration    time.Duration
 }
 
 func ConfigFromEnv() Config {
@@ -112,8 +133,16 @@ func ConfigFromEnv() Config {
 		AdminPrefix: normalizeAdminPrefix(
 			envString("REDEEMER_ADMIN_PREFIX", envString("REDEEMER_ADMIN_WEB_PREFIX", "xx")),
 		),
-		Host: envString("REDEEMER_HOST", "127.0.0.1"),
-		Port: int(envInt64("REDEEMER_PORT", 8789)),
+		UpstreamName:      envString("REDEEMER_UPSTREAM_NAME", "NewAPI"),
+		Host:              envString("REDEEMER_HOST", "127.0.0.1"),
+		Port:              int(envInt64("REDEEMER_PORT", 8789)),
+		PreviewRateLimit:  int(envInt64("REDEEMER_PREVIEW_RATE_LIMIT", 10)),
+		PreviewRateWindow: time.Duration(envInt64("REDEEMER_PREVIEW_RATE_WINDOW_SECONDS", 60)) * time.Second,
+		PreviewMismatchLimit: int(envInt64(
+			"REDEEMER_PREVIEW_MISMATCH_LIMIT",
+			5,
+		)),
+		PreviewLockDuration: time.Duration(envInt64("REDEEMER_PREVIEW_LOCK_SECONDS", 900)) * time.Second,
 	}
 }
 
@@ -441,7 +470,7 @@ func (s *Service) SetCodeStatus(ctx context.Context, input SetStatusInput) (map[
 	return record.toMap(), nil
 }
 
-func (s *Service) PreviewRedeemCode(ctx context.Context, code string, userID int64) (map[string]any, error) {
+func (s *Service) PreviewRedeemCode(ctx context.Context, code string, userID int64, email string) (map[string]any, error) {
 	code = strings.TrimSpace(code)
 	if code == "" {
 		return nil, serviceError("code 不能为空", http.StatusBadRequest)
@@ -456,12 +485,17 @@ func (s *Service) PreviewRedeemCode(ctx context.Context, code string, userID int
 	if err := validateRedeemable(record); err != nil {
 		return nil, err
 	}
+	user, err := s.verifyNewAPIUserEmail(ctx, userID, email)
+	if err != nil {
+		return nil, err
+	}
 	return map[string]any{
 		"code":       record.Code,
 		"user_id":    userID,
 		"plan_id":    record.PlanID,
 		"status":     record.Status,
 		"expires_at": nullIntToAny(record.ExpiresAt),
+		"user":       user,
 	}, nil
 }
 
@@ -472,6 +506,18 @@ func (s *Service) RedeemCode(ctx context.Context, input RedeemInput) (map[string
 	}
 	if input.UserID <= 0 {
 		return nil, serviceError("user_id 必须大于 0", http.StatusBadRequest)
+	}
+	if strings.TrimSpace(input.Email) != "" {
+		record, err := s.fetchCodeByCode(ctx, s.db, code)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateRedeemable(record); err != nil {
+			return nil, err
+		}
+		if _, err := s.verifyNewAPIUserEmail(ctx, input.UserID, input.Email); err != nil {
+			return nil, err
+		}
 	}
 	if input.AuditActorType == "" {
 		input.AuditActorType = "user"
@@ -601,10 +647,6 @@ func (s *Service) finalizeClaim(ctx context.Context, codeID int64, pendingToken 
 }
 
 func (s *Service) activateSubscription(ctx context.Context, userID, planID int64) (NewAPIResult, error) {
-	if err := s.config.ValidateRuntime(false); err != nil {
-		return NewAPIResult{}, err
-	}
-	base := strings.TrimRight(s.config.NewAPIBaseURL, "/")
 	var path string
 	var payload map[string]any
 	if s.config.BindMode == "create" {
@@ -614,41 +656,9 @@ func (s *Service) activateSubscription(ctx context.Context, userID, planID int64
 		path = "/api/subscription/admin/bind"
 		payload = map[string]any{"user_id": userID, "plan_id": planID}
 	}
-	body, err := json.Marshal(payload)
+	data, err := s.doNewAPIAdminJSON(ctx, http.MethodPost, path, payload)
 	if err != nil {
 		return NewAPIResult{}, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+path, bytes.NewReader(body))
-	if err != nil {
-		return NewAPIResult{}, err
-	}
-	accessToken := s.config.NewAPIAdminAccessToken
-	if !strings.HasPrefix(strings.ToLower(accessToken), "bearer ") {
-		accessToken = "Bearer " + accessToken
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", accessToken)
-	req.Header.Set("New-Api-User", strconv.FormatInt(s.config.NewAPIAdminUserID, 10))
-
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return NewAPIResult{}, serviceError("无法连接 NewAPI: "+err.Error(), http.StatusBadGateway)
-	}
-	defer resp.Body.Close()
-	rawBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return NewAPIResult{}, serviceError(fmt.Sprintf("NewAPI 返回 HTTP %d: %s", resp.StatusCode, truncate(string(rawBody), 500)), http.StatusBadGateway)
-	}
-	var data map[string]any
-	if err := json.Unmarshal(rawBody, &data); err != nil {
-		return NewAPIResult{}, serviceError("NewAPI 返回了无法解析的 JSON", http.StatusBadGateway)
-	}
-	if ok, _ := data["success"].(bool); !ok {
-		message, _ := data["message"].(string)
-		if message == "" {
-			message = "NewAPI 激活失败"
-		}
-		return NewAPIResult{}, serviceError(message, http.StatusBadGateway)
 	}
 	message, _ := data["message"].(string)
 	if dataField, ok := data["data"].(map[string]any); ok {
@@ -660,6 +670,183 @@ func (s *Service) activateSubscription(ctx context.Context, userID, planID int64
 		message = "订阅已激活"
 	}
 	return NewAPIResult{Message: message, Raw: data}, nil
+}
+
+func (s *Service) verifyNewAPIUserEmail(ctx context.Context, userID int64, email string) (map[string]any, error) {
+	email = normalizeEmail(email)
+	if email == "" {
+		return nil, serviceError("email 不能为空", http.StatusBadRequest)
+	}
+	if err := s.checkVerificationLocks(ctx, userID, email); err != nil {
+		return nil, err
+	}
+	user, err := s.fetchNewAPIUser(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	actualEmail, _ := user["email"].(string)
+	if actualEmail == "" {
+		return nil, serviceError("NewAPI 用户信息缺少 email，无法核对", http.StatusBadGateway)
+	}
+	if normalizeEmail(actualEmail) != email {
+		_ = s.recordVerificationMismatch(ctx, userID, email)
+		return nil, serviceError("用户邮箱与 NewAPI 记录不匹配", http.StatusBadRequest)
+	}
+	_ = s.clearVerificationFailures(ctx, userID, email)
+	return user, nil
+}
+
+func (s *Service) checkVerificationLocks(ctx context.Context, userID int64, email string) error {
+	if s.config.PreviewMismatchLimit <= 0 || s.config.PreviewLockDuration <= 0 {
+		return nil
+	}
+	now := time.Now().Unix()
+	keys := verificationKeys(userID, email)
+	for _, key := range keys {
+		var lockedUntil sql.NullInt64
+		err := s.db.QueryRowContext(
+			ctx,
+			`SELECT locked_until FROM verification_locks WHERE key_type = ? AND key_value = ?`,
+			key.Type,
+			key.Value,
+		).Scan(&lockedUntil)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if lockedUntil.Valid && lockedUntil.Int64 > now {
+			return serviceError("该用户 ID 或邮箱核对失败次数过多，请稍后再试", http.StatusTooManyRequests)
+		}
+		if lockedUntil.Valid {
+			if err := s.clearVerificationKey(ctx, key); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Service) recordVerificationMismatch(ctx context.Context, userID int64, email string) error {
+	if s.config.PreviewMismatchLimit <= 0 || s.config.PreviewLockDuration <= 0 {
+		return nil
+	}
+	now := time.Now().Unix()
+	lockedUntil := now + int64(s.config.PreviewLockDuration/time.Second)
+	for _, key := range verificationKeys(userID, email) {
+		if _, err := s.db.ExecContext(ctx, `
+			INSERT INTO verification_locks (
+				key_type, key_value, failure_count, locked_until, updated_at
+			) VALUES (?, ?, 1, CASE WHEN ? <= 1 THEN ? ELSE NULL END, ?)
+			ON CONFLICT(key_type, key_value) DO UPDATE SET
+				failure_count = verification_locks.failure_count + 1,
+				locked_until = CASE
+					WHEN verification_locks.failure_count + 1 >= ? THEN ?
+					ELSE verification_locks.locked_until
+				END,
+				updated_at = ?`,
+			key.Type,
+			key.Value,
+			s.config.PreviewMismatchLimit,
+			lockedUntil,
+			now,
+			s.config.PreviewMismatchLimit,
+			lockedUntil,
+			now,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) clearVerificationFailures(ctx context.Context, userID int64, email string) error {
+	for _, key := range verificationKeys(userID, email) {
+		if err := s.clearVerificationKey(ctx, key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) clearVerificationKey(ctx context.Context, key verificationKey) error {
+	_, err := s.db.ExecContext(
+		ctx,
+		`DELETE FROM verification_locks WHERE key_type = ? AND key_value = ?`,
+		key.Type,
+		key.Value,
+	)
+	return err
+}
+
+func (s *Service) fetchNewAPIUser(ctx context.Context, userID int64) (map[string]any, error) {
+	data, err := s.doNewAPIAdminJSON(ctx, http.MethodGet, fmt.Sprintf("/api/user/%d", userID), nil)
+	if err != nil {
+		return nil, err
+	}
+	rawUser := unwrapNewAPIData(data)
+	user := map[string]any{
+		"id":           firstNonNil(rawUser["id"], rawUser["user_id"], userID),
+		"username":     firstString(rawUser, "username", "name", "display_name"),
+		"email":        firstString(rawUser, "email"),
+		"group":        firstString(rawUser, "group", "group_name"),
+		"quota":        firstNonNil(rawUser["quota"], rawUser["total_quota"]),
+		"used_quota":   firstNonNil(rawUser["used_quota"], rawUser["used_amount"]),
+		"subscription": firstNonNil(rawUser["subscription"], rawUser["subscriptions"], rawUser["subscription_info"], rawUser["current_subscription"]),
+		"raw":          rawUser,
+	}
+	return user, nil
+}
+
+func (s *Service) doNewAPIAdminJSON(ctx context.Context, method, path string, payload any) (map[string]any, error) {
+	if err := s.config.ValidateRuntime(false); err != nil {
+		return nil, err
+	}
+	base := strings.TrimRight(s.config.NewAPIBaseURL, "/")
+	var body io.Reader
+	if payload != nil {
+		rawBody, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		body = bytes.NewReader(rawBody)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, base+path, body)
+	if err != nil {
+		return nil, err
+	}
+	accessToken := s.config.NewAPIAdminAccessToken
+	if !strings.HasPrefix(strings.ToLower(accessToken), "bearer ") {
+		accessToken = "Bearer " + accessToken
+	}
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.Header.Set("Authorization", accessToken)
+	req.Header.Set("New-Api-User", strconv.FormatInt(s.config.NewAPIAdminUserID, 10))
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, serviceError("无法连接 NewAPI: "+err.Error(), http.StatusBadGateway)
+	}
+	defer resp.Body.Close()
+	rawBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, serviceError(fmt.Sprintf("NewAPI 返回 HTTP %d: %s", resp.StatusCode, truncate(string(rawBody), 500)), http.StatusBadGateway)
+	}
+	var data map[string]any
+	if err := json.Unmarshal(rawBody, &data); err != nil {
+		return nil, serviceError("NewAPI 返回了无法解析的 JSON", http.StatusBadGateway)
+	}
+	if ok, exists := data["success"].(bool); exists && !ok {
+		message, _ := data["message"].(string)
+		if message == "" {
+			message = "NewAPI 请求失败"
+		}
+		return nil, serviceError(message, http.StatusBadGateway)
+	}
+	return data, nil
 }
 
 func (s *Service) fetchCodeByCode(ctx context.Context, q queryer, code string) (*CodeRecord, error) {
@@ -734,13 +921,62 @@ func (s *Service) insertAuditEvent(ctx context.Context, tx *sql.Tx, input AuditE
 }
 
 type Handler struct {
-	config  Config
-	service *Service
-	webFS   fs.FS
+	config             Config
+	service            *Service
+	webFS              fs.FS
+	previewRateLimiter *rateLimiter
+}
+
+type rateLimiter struct {
+	mu     sync.Mutex
+	limit  int
+	window time.Duration
+	hits   map[string][]time.Time
+}
+
+type verificationKey struct {
+	Type  string
+	Value string
+}
+
+func newRateLimiter(limit int, window time.Duration) *rateLimiter {
+	return &rateLimiter{
+		limit:  limit,
+		window: window,
+		hits:   map[string][]time.Time{},
+	}
+}
+
+func (r *rateLimiter) Allow(key string, now time.Time) bool {
+	if r.limit <= 0 || r.window <= 0 {
+		return true
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	cutoff := now.Add(-r.window)
+	recent := r.hits[key]
+	keep := recent[:0]
+	for _, hit := range recent {
+		if hit.After(cutoff) {
+			keep = append(keep, hit)
+		}
+	}
+	if len(keep) >= r.limit {
+		r.hits[key] = keep
+		return false
+	}
+	r.hits[key] = append(keep, now)
+	return true
 }
 
 func NewHandler(config Config, service *Service, webFS fs.FS) http.Handler {
-	return &Handler{config: config, service: service, webFS: webFS}
+	return &Handler{
+		config:             config,
+		service:            service,
+		webFS:              webFS,
+		previewRateLimiter: newRateLimiter(config.PreviewRateLimit, config.PreviewRateWindow),
+	}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -790,13 +1026,17 @@ func (h *Handler) handleGET(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handlePOST(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/api/v1/redeem/preview":
+		if !h.allowPreview(w, r) {
+			return
+		}
 		payload, ok := h.readJSON(w, r)
 		if !ok {
 			return
 		}
 		code := stringField(payload, "code")
 		userID, _ := intField(payload, "user_id")
-		result, err := h.service.PreviewRedeemCode(r.Context(), code, userID)
+		email := stringField(payload, "email")
+		result, err := h.service.PreviewRedeemCode(r.Context(), code, userID, email)
 		h.writeResultWithMessage(w, result, err, http.StatusOK, "兑换信息可用")
 	case "/api/v1/redeem":
 		payload, ok := h.readJSON(w, r)
@@ -805,9 +1045,15 @@ func (h *Handler) handlePOST(w http.ResponseWriter, r *http.Request) {
 		}
 		code := stringField(payload, "code")
 		userID, _ := intField(payload, "user_id")
+		email := stringField(payload, "email")
+		if email == "" {
+			h.writeError(w, serviceError("email 不能为空", http.StatusBadRequest))
+			return
+		}
 		result, err := h.service.RedeemCode(r.Context(), RedeemInput{
 			Code:           code,
 			UserID:         userID,
+			Email:          email,
 			AuditActorType: "user",
 			AuditActorID:   strconv.FormatInt(userID, 10),
 			AuditMetadata:  h.requestMetadata(r),
@@ -869,6 +1115,17 @@ func (h *Handler) handlePOST(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (h *Handler) allowPreview(w http.ResponseWriter, r *http.Request) bool {
+	if h.previewRateLimiter == nil {
+		return true
+	}
+	if h.previewRateLimiter.Allow(h.requestActorID(r), time.Now()) {
+		return true
+	}
+	h.writeError(w, serviceError("核对请求过于频繁，请稍后再试", http.StatusTooManyRequests))
+	return false
+}
+
 func (h *Handler) serveStatic(w http.ResponseWriter, path string) bool {
 	filename := ""
 	contentType := ""
@@ -888,6 +1145,9 @@ func (h *Handler) serveStatic(w http.ResponseWriter, path string) bool {
 	if err != nil {
 		h.json(w, http.StatusNotFound, response{Success: false, Message: "static file not found"})
 		return true
+	}
+	if strings.HasPrefix(contentType, "text/html") {
+		body = []byte(strings.ReplaceAll(string(body), "{{UPSTREAM_NAME}}", html.EscapeString(h.config.UpstreamName)))
 	}
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Cache-Control", "no-store")
@@ -985,10 +1245,35 @@ type response struct {
 }
 
 func Main(args []string, webFS fs.FS) int {
-	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+	if len(args) > 0 && (args[0] == "-h" || args[0] == "--help") {
 		printUsage()
 		return 0
 	}
+
+	ctx := context.Background()
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") || args[0] == "serve" {
+		if err := loadLocalEnvFile(); err != nil {
+			writeStderr(err)
+			return 1
+		}
+		config := ConfigFromEnv()
+		serveArgs := args
+		if len(args) > 0 && args[0] == "serve" {
+			serveArgs = args[1:]
+		}
+		config, err := parseServeConfig(config, serveArgs)
+		if err != nil {
+			return 2
+		}
+		service, err := NewService(config)
+		if err != nil {
+			writeStderr(err)
+			return 1
+		}
+		defer service.Close()
+		return runServe(ctx, service, config, webFS)
+	}
+
 	config := ConfigFromEnv()
 	service, err := NewService(config)
 	if err != nil {
@@ -997,7 +1282,6 @@ func Main(args []string, webFS fs.FS) int {
 	}
 	defer service.Close()
 
-	ctx := context.Background()
 	switch args[0] {
 	case "init-db":
 		if err := service.InitDB(); err != nil {
@@ -1005,8 +1289,6 @@ func Main(args []string, webFS fs.FS) int {
 			return 1
 		}
 		writeStdout(map[string]any{"success": true, "db_path": service.config.DBPath})
-	case "serve":
-		return commandServe(ctx, service, config, webFS, args[1:])
 	case "create-codes":
 		return commandCreateCodes(ctx, service, args[1:])
 	case "list-codes":
@@ -1024,18 +1306,50 @@ func Main(args []string, webFS fs.FS) int {
 	return 0
 }
 
-func commandServe(ctx context.Context, service *Service, config Config, webFS fs.FS, args []string) int {
+func parseServeConfig(config Config, args []string) (Config, error) {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	host := fs.String("host", config.Host, "")
 	port := fs.Int("port", config.Port, "")
+	dbPath := fs.String("db-path", config.DBPath, "")
+	adminSecret := fs.String("admin-secret", config.AdminSecret, "")
+	adminPrefix := fs.String("admin-prefix", config.AdminPrefix, "")
+	upstreamName := fs.String("upstream-name", config.UpstreamName, "")
+	bindMode := fs.String("bind-mode", config.BindMode, "")
+	timeoutSeconds := fs.Float64("timeout-seconds", config.TimeoutSeconds, "")
+	previewRateLimit := fs.Int("preview-rate-limit", config.PreviewRateLimit, "")
+	previewRateWindowSeconds := fs.Int64("preview-rate-window-seconds", int64(config.PreviewRateWindow/time.Second), "")
+	previewMismatchLimit := fs.Int("preview-mismatch-limit", config.PreviewMismatchLimit, "")
+	previewLockSeconds := fs.Int64("preview-lock-seconds", int64(config.PreviewLockDuration/time.Second), "")
+	newAPIBaseURL := fs.String("newapi-base-url", config.NewAPIBaseURL, "")
+	newAPIAdminAccessToken := fs.String("newapi-admin-access-token", config.NewAPIAdminAccessToken, "")
+	newAPIAdminUserID := fs.Int64("newapi-admin-user-id", config.NewAPIAdminUserID, "")
 	if err := fs.Parse(args); err != nil {
-		return 2
+		return config, err
 	}
+	config.Host = strings.TrimSpace(*host)
+	config.Port = *port
+	config.DBPath = strings.TrimSpace(*dbPath)
+	config.AdminSecret = strings.TrimSpace(*adminSecret)
+	config.AdminPrefix = normalizeAdminPrefix(*adminPrefix)
+	config.UpstreamName = strings.TrimSpace(*upstreamName)
+	config.BindMode = strings.TrimSpace(*bindMode)
+	config.TimeoutSeconds = *timeoutSeconds
+	config.PreviewRateLimit = *previewRateLimit
+	config.PreviewRateWindow = time.Duration(*previewRateWindowSeconds) * time.Second
+	config.PreviewMismatchLimit = *previewMismatchLimit
+	config.PreviewLockDuration = time.Duration(*previewLockSeconds) * time.Second
+	config.NewAPIBaseURL = strings.TrimSpace(*newAPIBaseURL)
+	config.NewAPIAdminAccessToken = strings.TrimSpace(*newAPIAdminAccessToken)
+	config.NewAPIAdminUserID = *newAPIAdminUserID
+	return config, nil
+}
+
+func runServe(ctx context.Context, service *Service, config Config, webFS fs.FS) int {
 	if err := service.InitDB(); err != nil {
 		writeStderr(err)
 		return 1
 	}
-	addr := fmt.Sprintf("%s:%d", *host, *port)
+	addr := fmt.Sprintf("%s:%d", config.Host, config.Port)
 	fmt.Println(mustJSON(map[string]any{"success": true, "listening": "http://" + addr, "db_path": service.config.DBPath}))
 	if err := http.ListenAndServe(addr, NewHandler(config, service, webFS)); err != nil {
 		writeStderr(err)
@@ -1125,6 +1439,7 @@ func commandRedeem(ctx context.Context, service *Service, args []string) int {
 	fs := flag.NewFlagSet("redeem", flag.ContinueOnError)
 	code := fs.String("code", "", "")
 	userID := fs.Int64("user-id", 0, "")
+	email := fs.String("email", "", "")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -1135,6 +1450,7 @@ func commandRedeem(ctx context.Context, service *Service, args []string) int {
 	result, err := service.RedeemCode(ctx, RedeemInput{
 		Code:           *code,
 		UserID:         *userID,
+		Email:          *email,
 		AuditActorType: "cli",
 		AuditActorID:   strconv.FormatInt(*userID, 10),
 		AuditMetadata:  map[string]any{"source": "cli"},
@@ -1163,6 +1479,122 @@ func commandSetStatus(ctx context.Context, service *Service, args []string) int 
 		AuditMetadata:  map[string]any{"source": "cli"},
 	})
 	return writeCommandResult(result, err)
+}
+
+func loadLocalEnvFile() error {
+	exePath, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	candidates := []string{filepath.Join(filepath.Dir(exePath), ".env.local")}
+	if cwd, err := os.Getwd(); err == nil && cwd != filepath.Dir(exePath) {
+		candidates = append(candidates, filepath.Join(cwd, ".env.local"))
+	}
+	for _, path := range candidates {
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return err
+		}
+		if err := loadEnvFile(path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func loadEnvFile(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	lineNumber := 0
+	for scanner.Scan() {
+		lineNumber++
+		line := strings.TrimSpace(strings.TrimPrefix(scanner.Text(), "\ufeff"))
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			return fmt.Errorf("%s:%d 环境变量格式应为 KEY=VALUE", path, lineNumber)
+		}
+		key = strings.TrimSpace(key)
+		if key == "" {
+			return fmt.Errorf("%s:%d 环境变量名不能为空", path, lineNumber)
+		}
+		value = strings.TrimSpace(stripInlineComment(strings.TrimSpace(value)))
+		unquoted, err := unquoteEnvValue(value)
+		if err != nil {
+			return fmt.Errorf("%s:%d %w", path, lineNumber, err)
+		}
+		if _, exists := os.LookupEnv(key); !exists {
+			if err := os.Setenv(key, unquoted); err != nil {
+				return err
+			}
+		}
+	}
+	return scanner.Err()
+}
+
+func stripInlineComment(value string) string {
+	inSingleQuote := false
+	inDoubleQuote := false
+	escaped := false
+	for i, r := range value {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if r == '\\' && inDoubleQuote {
+			escaped = true
+			continue
+		}
+		switch r {
+		case '\'':
+			if !inDoubleQuote {
+				inSingleQuote = !inSingleQuote
+			}
+		case '"':
+			if !inSingleQuote {
+				inDoubleQuote = !inDoubleQuote
+			}
+		case '#':
+			if !inSingleQuote && !inDoubleQuote && (i == 0 || unicode.IsSpace(rune(value[i-1]))) {
+				return strings.TrimSpace(value[:i])
+			}
+		}
+	}
+	return value
+}
+
+func unquoteEnvValue(value string) (string, error) {
+	if len(value) < 2 {
+		return value, nil
+	}
+	quote := value[0]
+	if quote != '\'' && quote != '"' {
+		return value, nil
+	}
+	if value[len(value)-1] != quote {
+		return "", fmt.Errorf("环境变量值引号未闭合")
+	}
+	value = value[1 : len(value)-1]
+	if quote == '\'' {
+		return value, nil
+	}
+	replacer := strings.NewReplacer(
+		`\\`, `\`,
+		`\n`, "\n",
+		`\r`, "\r",
+		`\t`, "\t",
+		`\"`, `"`,
+	)
+	return replacer.Replace(value), nil
 }
 
 func printUsage() {
@@ -1251,6 +1683,7 @@ func (i SetStatusInput) auditEvent(defaultValue string) string {
 type RedeemInput struct {
 	Code           string
 	UserID         int64
+	Email          string
 	AuditActorType string
 	AuditActorID   string
 	AuditMetadata  map[string]any
@@ -1645,6 +2078,49 @@ func stringDefault(payload map[string]any, key, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func normalizeEmail(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func verificationKeys(userID int64, email string) []verificationKey {
+	return []verificationKey{
+		{Type: "user_id", Value: strconv.FormatInt(userID, 10)},
+		{Type: "email_sha256", Value: emailHash(email)},
+	}
+}
+
+func emailHash(email string) string {
+	sum := sha256.Sum256([]byte(normalizeEmail(email)))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func unwrapNewAPIData(data map[string]any) map[string]any {
+	for _, key := range []string{"data", "user"} {
+		if nested, ok := data[key].(map[string]any); ok {
+			return nested
+		}
+	}
+	return data
+}
+
+func firstString(data map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := data[key].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func firstNonNil(values ...any) any {
+	for _, value := range values {
+		if value != nil {
+			return value
+		}
+	}
+	return nil
 }
 
 func intField(payload map[string]any, key string) (int64, bool) {
