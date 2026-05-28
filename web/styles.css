@@ -400,6 +400,29 @@ select:focus {
   gap: 12px;
 }
 
+.bulk-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 14px;
+}
+
+.bulk-select {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  width: auto;
+  font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+}
+
+.bulk-select input,
+.code-select {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--ink);
+}
+
 .code-item {
   display: grid;
   grid-template-columns: minmax(190px, 1fr) auto;
@@ -409,6 +432,15 @@ select:focus {
   border-radius: 14px 10px 15px 11px;
   background: rgba(255, 255, 255, 0.65);
   box-shadow: 3px 3px 0 rgba(34, 48, 71, 0.12);
+}
+
+.code-item.selectable-code {
+  grid-template-columns: auto minmax(190px, 1fr) auto;
+}
+
+.code-select {
+  align-self: start;
+  margin-top: 4px;
 }
 
 .audit-card {
@@ -486,6 +518,16 @@ select:focus {
   box-shadow: 2px 2px 0 rgba(34, 48, 71, 0.16);
 }
 
+.danger-button {
+  color: var(--danger);
+}
+
+.bulk-actions button:disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
+  transform: none;
+}
+
 .empty-state {
   padding: 18px;
   border: 2px dashed rgba(34, 48, 71, 0.65);
@@ -540,6 +582,14 @@ select:focus {
   .code-item,
   .review-list {
     grid-template-columns: 1fr;
+  }
+
+  .code-item.selectable-code {
+    grid-template-columns: auto 1fr;
+  }
+
+  .code-item.selectable-code .code-actions {
+    grid-column: 2;
   }
 
   .code-actions {

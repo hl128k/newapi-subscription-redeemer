@@ -321,6 +321,23 @@ curl -X POST http://127.0.0.1:8789/xx/api/v1/admin/codes/status \
   }'
 ```
 
+### 批量删除、停用或恢复兑换码
+
+```bash
+curl -X POST http://127.0.0.1:8789/xx/api/v1/admin/codes/batch \
+  -H 'Authorization: Bearer change-this' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "action": "disable",
+    "codes": [
+      "PRO-ABCD-EFGH-JKLM",
+      "PRO-2345-6789-WXYZ"
+    ]
+  }'
+```
+
+`action` 可选 `disable`、`restore`、`delete`。批量删除只允许删除未使用且不在处理中的兑换码。
+
 ### 查询审计日志
 
 ```bash
@@ -342,6 +359,8 @@ curl 'http://127.0.0.1:8789/xx/api/v1/admin/audit-events?limit=50' \
 | --- | --- |
 | `codes.created` | 管理员或 CLI 创建兑换码 |
 | `code.status_changed` | 管理员或 CLI 停用/恢复兑换码 |
+| `codes.status_changed` | 管理员批量停用/恢复兑换码 |
+| `codes.deleted` | 管理员批量删除兑换码 |
 | `code.redeemed` | 兑换码激活成功 |
 | `code.redeem_failed` | 兑换码激活失败并释放回 `active` |
 
@@ -400,6 +419,8 @@ POST /api/subscription/admin/users/123/subscriptions
 | `disabled` | 管理员停用 |
 
 兑换时会先把兑换码从 `active` 锁定为 `pending`，再调用 `newapi`。调用成功后写回 `used`；调用失败则恢复为 `active` 并记录错误。
+
+如果 NewAPI 套餐返回 `max_purchase_per_user`，兑换服务会在本地按“同一 NewAPI 用户 + 同一套餐”统计 `used` 和 `pending` 兑换码。数量达到套餐限购值时会提前拒绝兑换；`0` 或缺省表示不限制。
 
 ## Docker
 

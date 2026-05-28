@@ -111,6 +111,17 @@
           </label>
         </div>
 
+        <div class="bulk-actions">
+          <label class="bulk-select">
+            <input id="select-visible-codes" type="checkbox">
+            <span>本页</span>
+          </label>
+          <span class="micro-note" id="selected-summary">已选 0</span>
+          <button class="secondary-button" id="bulk-disable" type="button" disabled>停用</button>
+          <button class="secondary-button" id="bulk-restore" type="button" disabled>恢复</button>
+          <button class="ghost-button danger-button" id="bulk-delete" type="button" disabled>删除</button>
+        </div>
+
         <div id="codes-list" class="codes-list" aria-live="polite">
           <div class="empty-state">还没有加载兑换码。</div>
         </div>
@@ -132,6 +143,8 @@
               <option value="">全部</option>
               <option value="codes.created">生成兑换码</option>
               <option value="code.status_changed">兑换码状态变更</option>
+              <option value="codes.status_changed">批量状态变更</option>
+              <option value="codes.deleted">批量删除</option>
               <option value="code.redeemed">兑换成功</option>
               <option value="code.redeem_failed">兑换失败</option>
             </select>

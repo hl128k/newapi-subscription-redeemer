@@ -435,6 +435,9 @@ func (s *Service) SetCodeStatus(ctx context.Context, input SetStatusInput) (map[
 	if usedAt.Valid {
 		return nil, serviceError("已使用的兑换码不能改状态", http.StatusConflict)
 	}
+	if oldStatus == "pending" {
+		return nil, serviceError("处理中的兑换码不能改状态", http.StatusConflict)
+	}
 
 	_, err = tx.ExecContext(ctx, `UPDATE subscription_codes
 		SET status = ?, pending_at = NULL, pending_user_id = NULL,
@@ -470,6 +473,105 @@ func (s *Service) SetCodeStatus(ctx context.Context, input SetStatusInput) (map[
 	return record.toMap(), nil
 }
 
+func (s *Service) BatchCodes(ctx context.Context, input BatchCodesInput) (map[string]any, error) {
+	codes, err := normalizeCodeList(input.Codes)
+	if err != nil {
+		return nil, err
+	}
+
+	action := strings.TrimSpace(input.Action)
+	targetStatus := ""
+	eventType := ""
+	switch action {
+	case "delete":
+		eventType = "codes.deleted"
+	case "disable":
+		targetStatus = "disabled"
+		eventType = "codes.status_changed"
+	case "restore":
+		targetStatus = "active"
+		eventType = "codes.status_changed"
+	default:
+		return nil, serviceError("批量操作必须是 delete、disable 或 restore", http.StatusBadRequest)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer rollbackUnlessDone(tx)
+
+	records := make([]*CodeRecord, 0, len(codes))
+	for _, code := range codes {
+		record, err := s.fetchCodeByCode(ctx, tx, code)
+		if err != nil {
+			return nil, err
+		}
+		if action == "delete" {
+			if record.Status == "used" {
+				return nil, serviceError("已使用的兑换码不能删除", http.StatusConflict)
+			}
+			if record.Status == "pending" {
+				return nil, serviceError("处理中的兑换码不能删除", http.StatusConflict)
+			}
+		}
+		if targetStatus != "" && record.UsedAt.Valid {
+			return nil, serviceError("已使用的兑换码不能改状态", http.StatusConflict)
+		}
+		if targetStatus != "" && record.Status == "pending" {
+			return nil, serviceError("处理中的兑换码不能改状态", http.StatusConflict)
+		}
+		records = append(records, record)
+	}
+
+	for _, record := range records {
+		if action == "delete" {
+			if _, err := tx.ExecContext(ctx, "DELETE FROM subscription_codes WHERE id = ?", record.ID); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE subscription_codes
+			SET status = ?, pending_at = NULL, pending_user_id = NULL,
+				pending_token = NULL, last_error = NULL
+			WHERE id = ?`, targetStatus, record.ID); err != nil {
+			return nil, err
+		}
+	}
+
+	metadata := mergeMetadata(map[string]any{
+		"action": action,
+		"count":  len(records),
+		"codes":  codes,
+	}, input.AuditMetadata)
+	if targetStatus != "" {
+		metadata["new_status"] = targetStatus
+	}
+	if err := s.insertAuditEvent(ctx, tx, AuditEventInput{
+		EventType: eventType,
+		ActorType: input.auditActorType("cli"),
+		ActorID:   input.AuditActorID,
+		Status:    targetStatus,
+		Message:   fmt.Sprintf("%s %d codes", action, len(records)),
+		Metadata:  metadata,
+	}); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	result := map[string]any{
+		"action": action,
+		"count":  len(records),
+		"codes":  codes,
+	}
+	if targetStatus != "" {
+		result["status"] = targetStatus
+	}
+	return result, nil
+}
+
 func (s *Service) PreviewRedeemCode(ctx context.Context, code string, userID int64, email string) (map[string]any, error) {
 	code = strings.TrimSpace(code)
 	if code == "" {
@@ -493,6 +595,10 @@ func (s *Service) PreviewRedeemCode(ctx context.Context, code string, userID int
 	if err != nil {
 		return nil, err
 	}
+	planLimit := subscriptionPlanPurchaseLimit(plan)
+	if err := s.enforcePlanPurchaseLimit(ctx, s.db, userID, record.PlanID, planLimit); err != nil {
+		return nil, err
+	}
 	return map[string]any{
 		"code":       record.Code,
 		"user_id":    userID,
@@ -513,20 +619,28 @@ func (s *Service) RedeemCode(ctx context.Context, input RedeemInput) (map[string
 	if input.UserID <= 0 {
 		return nil, serviceError("user_id 必须大于 0", http.StatusBadRequest)
 	}
+	record, err := s.fetchCodeByCode(ctx, s.db, code)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateRedeemable(record); err != nil {
+		return nil, err
+	}
 	var verifiedUser map[string]any
 	if strings.TrimSpace(input.Email) != "" {
-		record, err := s.fetchCodeByCode(ctx, s.db, code)
-		if err != nil {
-			return nil, err
-		}
-		if err := validateRedeemable(record); err != nil {
-			return nil, err
-		}
 		user, err := s.verifyNewAPIUserEmail(ctx, input.UserID, input.Email)
 		if err != nil {
 			return nil, err
 		}
 		verifiedUser = user
+	}
+	plan, err := s.fetchSubscriptionPlan(ctx, record.PlanID)
+	if err != nil {
+		return nil, err
+	}
+	planLimit := subscriptionPlanPurchaseLimit(plan)
+	if err := s.enforcePlanPurchaseLimit(ctx, s.db, input.UserID, record.PlanID, planLimit); err != nil {
+		return nil, err
 	}
 	if input.AuditActorType == "" {
 		input.AuditActorType = "user"
@@ -535,7 +649,7 @@ func (s *Service) RedeemCode(ctx context.Context, input RedeemInput) (map[string
 		input.AuditActorID = strconv.FormatInt(input.UserID, 10)
 	}
 
-	claimed, err := s.claimCode(ctx, code, input.UserID)
+	claimed, err := s.claimCode(ctx, code, input.UserID, planLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -559,7 +673,7 @@ func (s *Service) RedeemCode(ctx context.Context, input RedeemInput) (map[string
 	return s.finalizeClaim(ctx, claimed.ID, claimed.PendingToken.String, input.UserID, verifiedUser, newAPIResult, input)
 }
 
-func (s *Service) claimCode(ctx context.Context, code string, userID int64) (*CodeRecord, error) {
+func (s *Service) claimCode(ctx context.Context, code string, userID int64, planLimit int64) (*CodeRecord, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -571,6 +685,9 @@ func (s *Service) claimCode(ctx context.Context, code string, userID int64) (*Co
 		return nil, err
 	}
 	if err := validateRedeemable(record); err != nil {
+		return nil, err
+	}
+	if err := s.enforcePlanPurchaseLimit(ctx, tx, userID, record.PlanID, planLimit); err != nil {
 		return nil, err
 	}
 
@@ -703,6 +820,25 @@ func (s *Service) verifyNewAPIUserEmail(ctx context.Context, userID int64, email
 	}
 	_ = s.clearVerificationFailures(ctx, userID, email)
 	return user, nil
+}
+
+func (s *Service) enforcePlanPurchaseLimit(ctx context.Context, q queryer, userID, planID, limit int64) error {
+	if limit <= 0 {
+		return nil
+	}
+	var count int64
+	err := q.QueryRowContext(ctx, `SELECT COUNT(1) FROM subscription_codes
+		WHERE plan_id = ? AND (
+			(status = 'used' AND used_by_user_id = ?) OR
+			(status = 'pending' AND pending_user_id = ?)
+		)`, planID, userID, userID).Scan(&count)
+	if err != nil {
+		return err
+	}
+	if count >= limit {
+		return serviceError(fmt.Sprintf("该 NewAPI 用户已达到此套餐限兑数量 %d，无法继续兑换", limit), http.StatusConflict)
+	}
+	return nil
 }
 
 func (s *Service) checkVerificationLocks(ctx context.Context, userID int64, email string) error {
@@ -1162,6 +1298,22 @@ func (h *Handler) handlePOST(w http.ResponseWriter, r *http.Request) {
 		result, err := h.service.SetCodeStatus(r.Context(), SetStatusInput{
 			Code:           stringField(payload, "code"),
 			Status:         stringField(payload, "status"),
+			AuditActorType: "admin",
+			AuditActorID:   h.requestActorID(r),
+			AuditMetadata:  h.requestMetadata(r),
+		})
+		h.writeResult(w, result, err, http.StatusOK)
+	case h.config.AdminAPIPath("/api/v1/admin/codes/batch"):
+		if !h.requireAdmin(w, r) {
+			return
+		}
+		payload, ok := h.readJSON(w, r)
+		if !ok {
+			return
+		}
+		result, err := h.service.BatchCodes(r.Context(), BatchCodesInput{
+			Codes:          stringListField(payload, "codes"),
+			Action:         stringField(payload, "action"),
 			AuditActorType: "admin",
 			AuditActorID:   h.requestActorID(r),
 			AuditMetadata:  h.requestMetadata(r),
@@ -1737,6 +1889,21 @@ func (i SetStatusInput) auditEvent(defaultValue string) string {
 	return defaultValue
 }
 
+type BatchCodesInput struct {
+	Codes          []string
+	Action         string
+	AuditActorType string
+	AuditActorID   string
+	AuditMetadata  map[string]any
+}
+
+func (i BatchCodesInput) auditActorType(defaultValue string) string {
+	if i.AuditActorType != "" {
+		return i.AuditActorType
+	}
+	return defaultValue
+}
+
 type RedeemInput struct {
 	Code           string
 	UserID         int64
@@ -1899,6 +2066,32 @@ func validateRedeemable(record *CodeRecord) error {
 		return serviceError("兑换码已过期", http.StatusGone)
 	}
 	return nil
+}
+
+func normalizeCodeList(codes []string) ([]string, error) {
+	if len(codes) == 0 {
+		return nil, serviceError("codes 不能为空", http.StatusBadRequest)
+	}
+	if len(codes) > 5000 {
+		return nil, serviceError("codes 最多一次处理 5000 个", http.StatusBadRequest)
+	}
+	seen := make(map[string]bool, len(codes))
+	normalized := make([]string, 0, len(codes))
+	for _, code := range codes {
+		code = strings.TrimSpace(code)
+		if code == "" {
+			continue
+		}
+		if seen[code] {
+			continue
+		}
+		seen[code] = true
+		normalized = append(normalized, code)
+	}
+	if len(normalized) == 0 {
+		return nil, serviceError("codes 不能为空", http.StatusBadRequest)
+	}
+	return normalized, nil
 }
 
 func generateCode(prefix string) (string, error) {
@@ -2142,6 +2335,20 @@ func stringField(payload map[string]any, key string) string {
 	return strings.TrimSpace(value)
 }
 
+func stringListField(payload map[string]any, key string) []string {
+	values, ok := payload[key].([]any)
+	if !ok {
+		return nil
+	}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if text, ok := value.(string); ok {
+			result = append(result, text)
+		}
+	}
+	return result
+}
+
 func stringDefault(payload map[string]any, key, fallback string) string {
 	value := stringField(payload, key)
 	if value == "" {
@@ -2225,6 +2432,15 @@ func subscriptionPlanName(plan map[string]any, planID int64) string {
 		return name
 	}
 	return fmt.Sprintf("套餐 %d", planID)
+}
+
+func subscriptionPlanPurchaseLimit(plan map[string]any) int64 {
+	for _, key := range []string{"max_purchase_per_user", "maxPurchasePerUser"} {
+		if value, ok := intField(plan, key); ok && value > 0 {
+			return value
+		}
+	}
+	return 0
 }
 
 func intField(payload map[string]any, key string) (int64, bool) {

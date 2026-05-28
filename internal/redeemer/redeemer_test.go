@@ -177,6 +177,85 @@ func TestCreateCodesWritesAuditEvent(t *testing.T) {
 	}
 }
 
+func TestBatchCodesDisablesRestoresAndDeletes(t *testing.T) {
+	ctx := context.Background()
+	service := testService(t, "http://127.0.0.1:1")
+	created, err := service.CreateCodes(ctx, CreateCodesInput{PlanID: 3, Count: 3, Prefix: "BAT"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	codes := []string{
+		created[0]["code"].(string),
+		created[1]["code"].(string),
+	}
+
+	if _, err := service.BatchCodes(ctx, BatchCodesInput{Codes: codes, Action: "disable", AuditActorType: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	disabled, err := service.ListCodes(ctx, "disabled", nil, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(disabled) != 2 {
+		t.Fatalf("expected 2 disabled codes, got %d", len(disabled))
+	}
+
+	if _, err := service.BatchCodes(ctx, BatchCodesInput{Codes: codes, Action: "restore", AuditActorType: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	active, err := service.ListCodes(ctx, "active", nil, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 3 {
+		t.Fatalf("expected 3 active codes, got %d", len(active))
+	}
+
+	result, err := service.BatchCodes(ctx, BatchCodesInput{Codes: codes, Action: "delete", AuditActorType: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result["count"] != 2 {
+		t.Fatalf("unexpected delete result: %#v", result)
+	}
+	remaining, err := service.ListCodes(ctx, "", nil, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) != 1 {
+		t.Fatalf("expected 1 remaining code, got %d", len(remaining))
+	}
+}
+
+func TestStatusChangesRejectPendingCodes(t *testing.T) {
+	ctx := context.Background()
+	service := testService(t, "http://127.0.0.1:1")
+	created, err := service.CreateCodes(ctx, CreateCodesInput{PlanID: 3, Count: 1, Prefix: "PND"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := created[0]["code"].(string)
+	if _, err := service.claimCode(ctx, code, 123, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := service.SetCodeStatus(ctx, SetStatusInput{Code: code, Status: "active"}); err == nil {
+		t.Fatalf("expected pending single status change to fail")
+	} else if status, _ := errorStatus(err); status != http.StatusConflict {
+		t.Fatalf("expected conflict, got %d: %v", status, err)
+	}
+	if _, err := service.BatchCodes(ctx, BatchCodesInput{Codes: []string{code}, Action: "disable"}); err == nil {
+		t.Fatalf("expected pending batch status change to fail")
+	} else if status, _ := errorStatus(err); status != http.StatusConflict {
+		t.Fatalf("expected conflict, got %d: %v", status, err)
+	}
+	if _, err := service.BatchCodes(ctx, BatchCodesInput{Codes: []string{code}, Action: "delete"}); err == nil {
+		t.Fatalf("expected pending batch delete to fail")
+	} else if status, _ := errorStatus(err); status != http.StatusConflict {
+		t.Fatalf("expected conflict, got %d: %v", status, err)
+	}
+}
+
 func TestPreviewRedeemCodeFetchesUserAndRequiresEmail(t *testing.T) {
 	ctx := context.Background()
 	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -336,17 +415,29 @@ func TestRedeemCodeSuccess(t *testing.T) {
 	var capturedHeaders http.Header
 	var capturedBody map[string]any
 	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		capturedPath = r.URL.Path
-		capturedHeaders = r.Header.Clone()
-		if err := json.NewDecoder(r.Body).Decode(&capturedBody); err != nil {
-			t.Fatal(err)
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/subscription/admin/plans":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"data": []map[string]any{
+					{"id": 3, "title": "Pro Monthly", "max_purchase_per_user": 0},
+				},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/subscription/admin/bind":
+			capturedPath = r.URL.Path
+			capturedHeaders = r.Header.Clone()
+			if err := json.NewDecoder(r.Body).Decode(&capturedBody); err != nil {
+				t.Fatal(err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"data": map[string]any{
+					"message": "用户分组将升级到 pro",
+				},
+			})
+		default:
+			t.Fatalf("unexpected NewAPI request: %s %s", r.Method, r.URL.Path)
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"success": true,
-			"data": map[string]any{
-				"message": "用户分组将升级到 pro",
-			},
-		})
 	}))
 	defer stub.Close()
 
@@ -376,6 +467,50 @@ func TestRedeemCodeSuccess(t *testing.T) {
 	}
 }
 
+func TestRedeemCodeRespectsPlanPurchaseLimit(t *testing.T) {
+	ctx := context.Background()
+	bindCount := 0
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/subscription/admin/plans":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"data": []map[string]any{
+					{"id": 3, "title": "Pro Monthly", "max_purchase_per_user": 2},
+				},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/subscription/admin/bind":
+			bindCount++
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"message": "ok",
+			})
+		default:
+			t.Fatalf("unexpected NewAPI request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer stub.Close()
+
+	service := testService(t, stub.URL)
+	created, err := service.CreateCodes(ctx, CreateCodesInput{PlanID: 3, Count: 3, Prefix: "LMT"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := service.RedeemCode(ctx, RedeemInput{Code: created[i]["code"].(string), UserID: 123}); err != nil {
+			t.Fatalf("redeem %d failed: %v", i+1, err)
+		}
+	}
+	if _, err := service.RedeemCode(ctx, RedeemInput{Code: created[2]["code"].(string), UserID: 123}); err == nil {
+		t.Fatalf("expected purchase limit error")
+	} else if status, _ := errorStatus(err); status != http.StatusConflict {
+		t.Fatalf("expected conflict, got %d: %v", status, err)
+	}
+	if bindCount != 2 {
+		t.Fatalf("expected only 2 upstream activations, got %d", bindCount)
+	}
+}
+
 func TestRedeemCodeAuditIncludesVerifiedUser(t *testing.T) {
 	ctx := context.Background()
 	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -387,6 +522,13 @@ func TestRedeemCodeAuditIncludesVerifiedUser(t *testing.T) {
 					"id":       123,
 					"username": "alice",
 					"email":    "alice@example.com",
+				},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/subscription/admin/plans":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"data": []map[string]any{
+					{"id": 3, "title": "Pro Monthly"},
 				},
 			})
 		case r.Method == http.MethodPost && r.URL.Path == "/api/subscription/admin/bind":
@@ -487,6 +629,50 @@ func TestAdminAPIRequiresPrefixAndReturnsAudit(t *testing.T) {
 	}
 	if !payload.Success || len(payload.Data) != 1 || payload.Data[0]["event_type"] != "codes.created" {
 		t.Fatalf("unexpected audit payload: %#v", payload)
+	}
+}
+
+func TestAdminBatchCodesEndpoint(t *testing.T) {
+	ctx := context.Background()
+	service := testService(t, "http://127.0.0.1:1")
+	created, err := service.CreateCodes(ctx, CreateCodesInput{PlanID: 8, Count: 2, Prefix: "ADM"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(NewHandler(service.config, service, fstest.MapFS{}))
+	defer server.Close()
+
+	body, err := json.Marshal(map[string]any{
+		"action": "disable",
+		"codes": []string{
+			created[0]["code"].(string),
+			created[1]["code"].(string),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/xx/api/v1/admin/codes/batch", stringsReader(string(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Admin-Secret", "test-secret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected batch status 200, got %d", resp.StatusCode)
+	}
+
+	items, err := service.ListCodes(ctx, "disabled", nil, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 disabled codes, got %d", len(items))
 	}
 }
 

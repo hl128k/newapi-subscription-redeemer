@@ -3,6 +3,8 @@ const state = {
   plans: [],
   plansById: new Map(),
   plansLoaded: false,
+  selectedCodes: new Set(),
+  visibleCodes: [],
   review: null,
   toastTimer: null,
 };
@@ -12,6 +14,8 @@ const $ = (selector) => document.querySelector(selector);
 const auditEventLabels = {
   "codes.created": "生成兑换码",
   "code.status_changed": "兑换码状态变更",
+  "codes.status_changed": "批量状态变更",
+  "codes.deleted": "批量删除",
   "code.redeemed": "兑换成功",
   "code.redeem_failed": "兑换失败",
 };
@@ -332,8 +336,37 @@ function describeCode(item) {
   return parts;
 }
 
+function selectedCodeList() {
+  return Array.from(state.selectedCodes);
+}
+
+function updateBulkControls() {
+  const selectedCount = state.selectedCodes.size;
+  const summary = $("#selected-summary");
+  if (summary) {
+    summary.textContent = `已选 ${selectedCount}`;
+  }
+  for (const selector of ["#bulk-disable", "#bulk-restore", "#bulk-delete"]) {
+    const button = $(selector);
+    if (button) {
+      button.disabled = selectedCount === 0;
+    }
+  }
+  const selectVisible = $("#select-visible-codes");
+  if (selectVisible) {
+    const visibleCount = state.visibleCodes.length;
+    const selectedVisibleCount = state.visibleCodes.filter((code) => state.selectedCodes.has(code)).length;
+    selectVisible.checked = visibleCount > 0 && selectedVisibleCount === visibleCount;
+    selectVisible.indeterminate = selectedVisibleCount > 0 && selectedVisibleCount < visibleCount;
+    selectVisible.disabled = visibleCount === 0;
+  }
+}
+
 function renderCodes(items) {
   const list = $("#codes-list");
+  state.visibleCodes = items.map((item) => item.code);
+  state.selectedCodes = new Set(selectedCodeList().filter((code) => state.visibleCodes.includes(code)));
+  updateBulkControls();
   $("#list-summary").textContent = `共 ${items.length} 条`;
   if (!items.length) {
     list.innerHTML = '<div class="empty-state">没有匹配的兑换码。</div>';
@@ -343,7 +376,15 @@ function renderCodes(items) {
   list.replaceChildren(
     ...items.map((item) => {
       const card = document.createElement("div");
-      card.className = "code-item";
+      card.className = "code-item selectable-code";
+
+      const select = document.createElement("input");
+      select.className = "code-select";
+      select.type = "checkbox";
+      select.dataset.action = "select-code";
+      select.dataset.code = item.code;
+      select.checked = state.selectedCodes.has(item.code);
+      select.setAttribute("aria-label", `选择 ${item.code}`);
 
       const main = document.createElement("div");
       main.className = "code-main";
@@ -387,7 +428,7 @@ function renderCodes(items) {
         actions.append(toggle);
       }
 
-      card.append(main, actions);
+      card.append(select, main, actions);
       return card;
     }),
   );
@@ -495,6 +536,32 @@ async function refreshAdminLists() {
   await refreshAuditEvents();
 }
 
+async function runBatchCodeAction(action) {
+  const codes = selectedCodeList();
+  if (!codes.length) {
+    showToast("请先选择兑换码");
+    return;
+  }
+  if (action === "delete" && !window.confirm(`确认删除选中的 ${codes.length} 个兑换码？`)) {
+    return;
+  }
+  const payload = await apiJson(`${currentAdminApiBase()}/codes/batch`, {
+    method: "POST",
+    admin: true,
+    body: { action, codes },
+  });
+  state.selectedCodes.clear();
+  await refreshCodes();
+  await refreshAuditEvents();
+  const count = payload.data?.count ?? codes.length;
+  const labels = {
+    delete: "已删除",
+    disable: "已停用",
+    restore: "已恢复",
+  };
+  showToast(`${labels[action] || "已处理"} ${count} 个兑换码`);
+}
+
 function bindAdminPage() {
   syncSecretField();
   renderPlanSelects();
@@ -594,7 +661,48 @@ function bindAdminPage() {
     });
   }
 
+  $("#select-visible-codes").addEventListener("change", (event) => {
+    if (event.target.checked) {
+      for (const code of state.visibleCodes) {
+        state.selectedCodes.add(code);
+      }
+    } else {
+      for (const code of state.visibleCodes) {
+        state.selectedCodes.delete(code);
+      }
+    }
+    document.querySelectorAll("input[data-action='select-code']").forEach((input) => {
+      input.checked = state.selectedCodes.has(input.dataset.code);
+    });
+    updateBulkControls();
+  });
+
+  for (const [selector, action] of [
+    ["#bulk-disable", "disable"],
+    ["#bulk-restore", "restore"],
+    ["#bulk-delete", "delete"],
+  ]) {
+    $(selector).addEventListener("click", async () => {
+      try {
+        await runBatchCodeAction(action);
+      } catch (error) {
+        showToast(error.message);
+      }
+    });
+  }
+
   $("#codes-list").addEventListener("click", async (event) => {
+    const checkbox = event.target.closest("input[data-action='select-code']");
+    if (checkbox) {
+      if (checkbox.checked) {
+        state.selectedCodes.add(checkbox.dataset.code);
+      } else {
+        state.selectedCodes.delete(checkbox.dataset.code);
+      }
+      updateBulkControls();
+      return;
+    }
+
     const button = event.target.closest("button[data-action]");
     if (!button) {
       return;
